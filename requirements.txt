@@ -1,0 +1,8 @@
+numpy
+pandas
+pyyaml
+scipy
+matplotlib
+mlflow
+tqdm
+rich

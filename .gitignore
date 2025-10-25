@@ -1,0 +1,3 @@
+mlruns
+.dockerignore
+src/__pycache__/hello_mlflow.cpython-311.pyc
