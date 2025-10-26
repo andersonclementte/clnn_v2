@@ -1,3 +1,5 @@
 mlruns
 .dockerignore
 src/__pycache__/hello_mlflow.cpython-311.pyc
+data/humob_all_cities_v2_normalized.parquet
+centers_A_paper.npy

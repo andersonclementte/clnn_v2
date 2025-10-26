@@ -6,3 +6,6 @@ matplotlib
 mlflow
 tqdm
 rich
+scikit-learn
+pyarrow
+seaborn

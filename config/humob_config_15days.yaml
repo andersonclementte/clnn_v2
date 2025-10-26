@@ -1,0 +1,30 @@
+# Configuração HuMob - 15 dias LSTM
+data:
+  parquet_file: "humob_all_cities_v2_normalized.parquet"
+  processed_data_path: "data/processed/"
+
+model:
+  n_clusters: 512
+  n_users: 100000
+  sequence_length: 720  # ← 15 dias × 48 slots = 720
+
+training:
+  base:
+    n_epochs: 10
+    learning_rate: 1e-3
+    batch_size: 8       # Reduzido para sequências maiores
+    mixed_precision: true
+  finetune:
+    n_epochs: 5
+    learning_rate: 5e-5
+    batch_size: 4       # Ainda menor para fine-tuning
+
+hardware:
+  device: "cuda"
+  pin_memory: true
+  num_workers: 4
+
+outputs:
+  models_path: "outputs/models/"
+  submissions_path: "outputs/submissions/"
+  plots_path: "outputs/plots/"
