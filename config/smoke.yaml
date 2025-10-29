@@ -1,28 +1,39 @@
-# Configuração HuMob - 15 dias LSTM
+experiment_name: humob2
+logging:
+  tracking_uri: "file:./mlruns"
+
 data:
   parquet_file: "humob_all_cities_v2_normalized.parquet"
-  processed_data_path: "data/processed/"
+  base_city: "A"
+  finetune_cities: ["B","C","D"]
 
 model:
-  n_clusters: 32
-  n_users: 10000 #100000
-  sequence_length: 48 #720  # ← 15 dias × 48 slots = 720
+  n_clusters: 16        # poucos clusters para acelerar o KMeans
+  n_users: 100000          # amostra pequena de usuários
+  sequence_length: 12   # janelas curtas
 
 training:
   base:
-    n_epochs: 2
-    learning_rate: 1e-3
-    batch_size: 8       # Reduzido para sequências maiores
+    n_epochs: 1
+    learning_rate: 3e-4
+    batch_size: 16
     mixed_precision: true
   finetune:
     n_epochs: 1
     learning_rate: 5e-5
-    batch_size: 4       # Ainda menor para fine-tuning
+    batch_size: 8
 
 hardware:
-  device: "cuda"
+  device: "cuda"        # cai para "cpu" se não tiver GPU
   pin_memory: true
-  num_workers: 4
+  num_workers: 0        # IterableDataset: evita duplicar leitura
+
+eval:
+  compare: true
+  n_samples: 200        # comparação rápida
+
+submission:
+  enabled: false
 
 outputs:
   models_path: "outputs/models/"

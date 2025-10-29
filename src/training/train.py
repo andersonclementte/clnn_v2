@@ -16,8 +16,8 @@ from src.data.dataset import create_humob_loaders, create_test_loader
 # MLflow - Import do tracker personalizado
 from src.utils.mlflow_tracker import HuMobMLflowTracker
 from src.utils.simple_checkpoint import (
-    save_checkpoint, 
-    load_checkpoint, 
+    save_checkpoint,
+    load_training_checkpoint,
     get_latest_checkpoint
 )
 
@@ -224,16 +224,16 @@ def train_humob_model(
         return (total ** 0.5)
     
     # Verifica se deve retomar
-    start_epoch = 0
-    if resume_from_checkpoint:
-        latest_checkpoint = get_latest_checkpoint()
-        if latest_checkpoint:
-            print(f"🔄 Retomando treinamento do checkpoint: {latest_checkpoint}")
-            start_epoch = load_checkpoint(model, optimizer, latest_checkpoint)
-            start_epoch += 1  # Começa da próxima época
-            print(f"🚀 Continuando da época {start_epoch}/{n_epochs}")
-        else:
-            print("📝 Nenhum checkpoint encontrado, iniciando do zero")
+    # start_epoch = 0
+    # if resume_from_checkpoint:
+    #     latest_checkpoint = get_latest_checkpoint()
+    #     if latest_checkpoint:
+    #         print(f"🔄 Retomando treinamento do checkpoint: {latest_checkpoint}")
+    #         start_epoch = load_checkpoint(model, optimizer, latest_checkpoint)
+    #         start_epoch += 1  # Começa da próxima época
+    #         print(f"🚀 Continuando da época {start_epoch}/{n_epochs}")
+    #     else:
+    #         print("📝 Nenhum checkpoint encontrado, iniciando do zero")
     
     best_val_loss = float('inf')
     train_losses = []
@@ -243,6 +243,15 @@ def train_humob_model(
     print(f"Parâmetros treináveis: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
     stopper = EarlyStopper(patience=3, min_delta=1e-4, mode='min')
+
+    latest = get_latest_checkpoint("outputs/models/checkpoints", "checkpoint_epoch_*.pt")
+    if latest:
+        print(f"🔁 Retomando de {latest}")
+        start_epoch, _ = load_training_checkpoint(model, optimizer, latest, map_location="cpu", strict=True,
+                                                scheduler=scheduler if 'scheduler' in locals() else None)
+    else:
+        print("🚀 Nenhum checkpoint encontrado, iniciando do zero")
+        start_epoch = 0
     
     for epoch in range(start_epoch, n_epochs):
         # === TREINO ===
@@ -357,43 +366,86 @@ def train_humob_model(
         print(f"Fusion weights: w_r={w_r:.3f}, w_e={w_e:.3f}")
         
         
-        # Salva a cada N épocas
-        if (epoch + 1) % checkpoint_every_n_epochs == 0:
-            save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                val_loss=avg_val_loss,
-                save_dir="outputs/models/checkpoints/",
-                filename=f"checkpoint_epoch_{epoch+1}.pt",
-                extra_data={
-                    'centers': cluster_centers.cpu().numpy(),
-                    'config': {
-                        'n_users': n_users,
-                        'n_cities': 4,
-                        'sequence_length': sequence_length,
-                        'prediction_steps': 1,
-                        'n_clusters': cluster_centers.shape[0]
-                    },
-                    'train_loss': avg_train_loss,
-                    'mlflow_run_id': run_id  # Agora sempre definido
-                }
-            )
+        # # Salva a cada N épocas
+        # if (epoch + 1) % checkpoint_every_n_epochs == 0:
+        #     save_checkpoint(
+        #         model=model,
+        #         optimizer=optimizer,
+        #         epoch=epoch,
+        #         val_loss=avg_val_loss,
+        #         save_dir="outputs/models/checkpoints/",
+        #         filename=f"checkpoint_epoch_{epoch+1}.pt",
+        #         extra_data={
+        #             'centers': cluster_centers.cpu().numpy(),
+        #             'config': {
+        #                 'n_users': n_users,
+        #                 'n_cities': 4,
+        #                 'sequence_length': sequence_length,
+        #                 'prediction_steps': 1,
+        #                 'n_clusters': cluster_centers.shape[0]
+        #             },
+        #             'train_loss': avg_train_loss,
+        #             'mlflow_run_id': run_id  # Agora sempre definido
+        #         }
+        #     )
             
-        # MLflow logging
-        if mlflow_tracker is not None:
-            mlflow_tracker.log_training_metrics(
-                epoch=epoch,
-                train_loss=avg_train_loss,
-                val_loss=avg_val_loss,
-                fusion_w_r=w_r,       # <- NÃO passe dict
-                fusion_w_e=w_e,
-                grad_norm=post_clip_norm,
-                learning_rate=optimizer.param_groups[0]["lr"]
-            )
+        # # MLflow logging
+        # if mlflow_tracker is not None:
+        #     mlflow_tracker.log_training_metrics(
+        #         epoch=epoch,
+        #         train_loss=avg_train_loss,
+        #         val_loss=avg_val_loss,
+        #         fusion_w_r=w_r,       # <- NÃO passe dict
+        #         fusion_w_e=w_e,
+        #         grad_norm=post_clip_norm,
+        #         learning_rate=optimizer.param_groups[0]["lr"]
+        #     )
 
-            # Remove checkpoints antigos
-            _cleanup_old_checkpoints(keep_last_n_checkpoints)
+        #     # Remove checkpoints antigos
+        #     _cleanup_old_checkpoints(keep_last_n_checkpoints)
+
+        # centers como tensor (sem numpy)
+        centers_tensor = cluster_centers.detach().cpu()
+
+        # 1) salvar checkpoint
+        ckpt_path = save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,        # se existir
+            epoch=epoch,
+            val_loss=avg_val_loss,
+            save_dir="outputs/models/checkpoints/",
+            filename=f"checkpoint_epoch_{epoch+1:03d}.pt",
+            extra_data={
+                'centers': centers_tensor,               # <- tensor, seguro
+                'config': {
+                    'n_users': n_users,
+                    'n_cities': 4,
+                    'sequence_length': sequence_length,
+                    'prediction_steps': 1,
+                    'n_clusters': int(centers_tensor.shape[0]),
+                },
+                'train_loss': float(avg_train_loss),
+                'mlflow_run_id': run_id
+            }
+        )
+        _cleanup_old_checkpoints(keep_last_n_checkpoints)
+
+        # 2) depois loga no MLflow (try/except para nunca derrubar treino)
+        try:
+            if mlflow_tracker is not None:
+                mlflow_tracker.log_model_artifact(model, ckpt_path, artifact_path="models")
+                mlflow_tracker.log_training_metrics(
+                    step=epoch,
+                    train_loss=float(avg_train_loss),
+                    val_loss=float(avg_val_loss),
+                    grad_norm=float(post_clip_norm),
+                    lr=float(optimizer.param_groups[0]["lr"]),
+                    fusion_w_r=float(w_r),
+                    fusion_w_e=float(w_e),
+                )
+        except Exception as e:
+            print(f"[MLflow] logging ignorado: {e}")
 
         # Learning rate scheduling
         scheduler.step(avg_val_loss)
@@ -443,92 +495,139 @@ def evaluate_model(
     cities: list[str] = ["D"],
     n_samples: int = 5000,
     sequence_length: int = 24,
-    mlflow_tracker: HuMobMLflowTracker = None,
-    model_type: str = "zero_shot"
+    mlflow_tracker: HuMobMLflowTracker | None = None,
+    model_type: str = "zero_shot",
 ):
-    """Avalia o modelo em cidades específicas com tracking MLflow."""
+    """
+    Avalia o modelo em cidades específicas com tracking MLflow.
+    Suporta checkpoints e 'best models' com diferentes layouts.
+    """
     print(f"🎯 Avaliando modelo em cidades {cities}...")
-    
-    # 1. Carrega checkpoint
-    import numpy as np, torch
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    centers = torch.from_numpy(ckpt['centers']).to(device)
-    config = ckpt['config']
-    
-    # 2. Instancia modelo
+
+    # --- imports locais para evitar dependências de topo ---
+    import numpy as np
+    import torch
+    from torch import nn
+    from tqdm import tqdm
+    try:
+        # suas funções/classes
+        from src.models.humob_model import HuMobModel, discretize_coordinates
+    except Exception:
+        # se já estiverem importadas no módulo, ignore
+        pass
+
+    # 1) Carrega checkpoint (compatível com PyTorch >= 2.6)
+    try:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(checkpoint_path, map_location=device)
+
+    # 1.1) Recupera centers (aceita raiz ou extra.centers; tensor ou numpy)
+    centers_obj = ckpt.get("centers", None)
+    if centers_obj is None:
+        centers_obj = ckpt.get("extra", {}).get("centers", None)
+    if centers_obj is None:
+        raise RuntimeError(
+            "Centers não encontrados no checkpoint (nem em 'centers' nem em 'extra.centers')."
+        )
+
+    if isinstance(centers_obj, torch.Tensor):
+        centers = centers_obj.to(device)
+    else:
+        centers = torch.as_tensor(centers_obj, dtype=torch.float32, device=device)
+
+    # 1.2) Config (opcional) para n_users/n_cities/seq_len
+    cfg = ckpt.get("config", ckpt.get("extra", {}).get("config", {}))
+    n_users = int(cfg.get("n_users", 100_000))
+    n_cities = int(cfg.get("n_cities", 4))
+    seq_len_eval = int(cfg.get("sequence_length", sequence_length))
+
+    # 1.3) State dict (aceita diferentes chaves)
+    state = ckpt.get("state_dict", ckpt.get("model_state_dict", None))
+    if state is None:
+        # fallback: checkpoint pode ser o próprio state_dict
+        state = ckpt
+
+    # 2) Instancia modelo e carrega pesos
     model = HuMobModel(
-        n_users=config['n_users'],
-        n_cities=config['n_cities'],
+        n_users=n_users,
+        n_cities=n_cities,
         cluster_centers=centers,
-        sequence_length=sequence_length,
-        prediction_steps=1
+        sequence_length=seq_len_eval,
+        prediction_steps=1,
     ).to(device)
-    
-    model.load_state_dict(ckpt['state_dict'])
+    model.load_state_dict(state, strict=True)
     model.eval()
-    
-    # 3. Cria loader de teste
-    test_loader = create_test_loader(
+
+    # 3) Loader de teste (use o mesmo seq_len do treino salvo se possível)
+    test_loader = create_test_loader(  # presume que já existe essa função no seu código
         parquet_path=parquet_path,
         cities=cities,
         batch_size=32,
-        sequence_length=sequence_length
+        sequence_length=seq_len_eval,
     )
-    
-    # 4. Avalia
-    criterion = nn.MSELoss()
-    total_loss = 0
+
+    # 4) Avaliação
+    criterion = nn.MSELoss(reduction="mean")
+    total_loss = 0.0
     total_samples = 0
-    coord_errors = []
-    
+    cell_err_sum = 0.0
+    cell_err_count = 0
+
     with torch.no_grad():
-        pbar = tqdm(test_loader, desc='Eval')
-        
+        pbar = tqdm(test_loader, desc="Eval")
         for batch in pbar:
             if total_samples >= n_samples:
                 break
-                
+
             try:
-                uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, target_coords = [b.to(device) for b in batch]
-                
-                pred = model.forward_single_step(uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq)
+                uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, target_coords = [
+                    b.to(device) for b in batch
+                ]
+
+                pred = model.forward_single_step(
+                    uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq
+                )
                 target = target_coords.squeeze(1)
-                
+
                 loss = criterion(pred, target)
-                total_loss += loss.item() * target.size(0)
-                total_samples += target.size(0)
-                
-                # Erro em células
-                pred_discrete = discretize_coordinates(pred)
-                target_discrete = discretize_coordinates(target)
-                cell_error = torch.abs(pred_discrete - target_discrete).float().mean(dim=1)
-                coord_errors.extend(cell_error.cpu().tolist())
-                
-                pbar.set_postfix({
-                    'MSE': f'{loss.item():.4f}',
-                    'Samples': total_samples
-                })
-                
+                bs = target.size(0)
+                total_loss += float(loss.item()) * bs
+                total_samples += bs
+
+                # Erro em células (média por amostra; depois média global)
+                pred_disc = discretize_coordinates(pred)
+                target_disc = discretize_coordinates(target)
+                cell_err = (pred_disc - target_disc).abs().float().mean(dim=1)  # [bs]
+                cell_err_sum += float(cell_err.sum().item())
+                cell_err_count += int(cell_err.numel())
+
+                pbar.set_postfix({"MSE": f"{loss.item():.4f}", "Samples": total_samples})
+
             except Exception as e:
+                # pula batch problemático sem derrubar a avaliação
                 continue
-    
+
     avg_mse = total_loss / max(total_samples, 1)
-    avg_cell_error = np.mean(coord_errors)
-    
+    avg_cell_error = (cell_err_sum / max(cell_err_count, 1)) if cell_err_count else float("nan")
+
     print(f"\n📊 Resultados em {cities}:")
     print(f"  MSE: {avg_mse:.4f}")
     print(f"  Erro médio em células: {avg_cell_error:.2f}")
     print(f"  Amostras avaliadas: {total_samples:,}")
-    
-    # MLflow logging
+
+    # 5) MLflow logging (somente escalares)
     if mlflow_tracker is not None:
-        for city in cities:
-            mlflow_tracker.log_evaluation_results(
-                city=city,
-                mse=avg_mse,
-                cell_error=avg_cell_error,
-                n_samples=total_samples,
-                model_type=model_type
-            )
-    
-    return avg_mse, avg_cell_error
+        try:
+            for c in cities:
+                mlflow_tracker.log_evaluation_results(
+                    city=c,
+                    mse=float(avg_mse),
+                    cell_error=float(avg_cell_error),
+                    n_samples=int(total_samples),
+                    model_type=model_type,
+                )
+        except Exception as e:
+            print(f"[MLflow] logging de avaliação ignorado: {e}")
+
+    return float(avg_mse), float(avg_cell_error)

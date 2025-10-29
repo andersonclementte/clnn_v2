@@ -8,13 +8,14 @@ import os
 from datetime import datetime
 
 from src.models.humob_model import HuMobModel
-from src.data.dataset import create_humob_loaders
+from src.data.dataset import HuMobNormalizedDataset
 
 from src.utils.mlflow_tracker import HuMobMLflowTracker
 from src.utils.simple_checkpoint import (
-    save_checkpoint, 
-    load_checkpoint, 
-    get_latest_checkpoint
+    save_checkpoint,
+    load_training_checkpoint,
+    get_latest_checkpoint,
+    cleanup_old_checkpoints,
 )
 
 class EarlyStopper:
@@ -34,22 +35,6 @@ class EarlyStopper:
             self.wait += 1
             if self.wait >= self.patience:
                 self.should_stop = True
-
-
-def load_checkpoint_safe(checkpoint_path: str, device: torch.device):
-    """Carrega checkpoint com compatibilidade PyTorch 2.6+."""
-    try:
-        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        return ckpt
-    except Exception as e:
-        if "weights_only" in str(e) or "multiarray" in str(e):
-            print("⚠️  Usando safe_globals para compatibilidade PyTorch 2.6+")
-            with torch.serialization.safe_globals([np._core.multiarray._reconstruct]):
-                ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
-                return ckpt
-        else:
-            raise e
-
 
 def finetune_model(
     parquet_path: str,
@@ -92,28 +77,47 @@ def finetune_model(
     
     # 1. Carrega modelo pré-treinado
     print("📂 Carregando modelo pré-treinado...")
-    ckpt = load_checkpoint_safe(pretrained_checkpoint, device)
-    
-    centers = torch.from_numpy(ckpt['centers']).to(device)
-    config = ckpt['config']
+    try:
+        ckpt = torch.load(pretrained_checkpoint, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(pretrained_checkpoint, map_location=device)
+
+    # centers: aceita raiz ou extra.centers; tensor ou numpy
+    centers_obj = ckpt.get('centers', None)
+    if centers_obj is None:
+        centers_obj = ckpt.get('extra', {}).get('centers', None)
+    if centers_obj is None:
+        raise RuntimeError("Centers não encontrados no checkpoint base.")
+
+    if isinstance(centers_obj, torch.Tensor):
+        centers = centers_obj.to(device)
+    else:
+        centers = torch.as_tensor(centers_obj, dtype=torch.float32, device=device)
+
+    # config (pode estar em raiz ou extra)
+    config = ckpt.get('config', ckpt.get('extra', {}).get('config', {}))
+
+    # pesos: aceita state_dict, model_state_dict, ou o próprio dict
+    state = ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt))
+
     
     # 2. Instancia modelo
     model = HuMobModel(
-        n_users=config['n_users'],
-        n_cities=config['n_cities'],
+        n_users=int(config.get('n_users', 100_000)),
+        n_cities=int(config.get('n_cities', 4)),
         cluster_centers=centers,
         sequence_length=sequence_length,
-        prediction_steps=config.get('prediction_steps', 1)
+        prediction_steps=int(config.get('prediction_steps', 1)),
     ).to(device)
-    
-    model.load_state_dict(ckpt['state_dict'])
-    print(f"✅ Modelo pré-treinado carregado (loss: {ckpt.get('val_loss', 'N/A')})")
+
+    model.load_state_dict(state, strict=True)
+    print(f"✅ Modelo pré-treinado carregado (val_loss_base: {ckpt.get('val_loss', 'N/A')})")
+
     
     # 3. Cria loaders
     print(f"📊 Criando datasets para cidade {target_city}...")
     
-    from src.data.dataset import HuMobNormalizedDataset
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, IterableDataset
     
     train_ds = HuMobNormalizedDataset(
         parquet_path=parquet_path,
@@ -131,12 +135,23 @@ def finetune_model(
         mode="val",
         sequence_length=sequence_length,
         train_days=data_split,
-        val_days=(0.75, 0.8),
+        val_days=(0.8, 1.0),
         max_sequences_per_user=10
     )
     
-    train_loader = DataLoader(train_ds, batch_size=batch_size, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, num_workers=0)
+    # CORREÇÃO A: Loaders com shuffle e pin_memory
+    pin = (device.type == "cuda")
+    is_iter = isinstance(train_ds, IterableDataset)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, num_workers=0,
+        shuffle=(False if is_iter else True), pin_memory=pin
+    )
+    
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, num_workers=0,
+        shuffle=False, pin_memory=pin
+    )
     
     # 4. Setup de fine-tuning
     optimizer = torch.optim.AdamW(
@@ -156,13 +171,15 @@ def finetune_model(
     # Checkpoint
     start_epoch = 0
     checkpoint_dir = f"outputs/models/checkpoints/finetune_{target_city}/"
-    
+
     if resume_from_checkpoint:
-        latest = get_latest_checkpoint(checkpoint_dir)
+        latest = get_latest_checkpoint(checkpoint_dir, pattern="checkpoint_epoch_*.pt")
         if latest:
             print(f"🔄 Retomando fine-tuning: {latest}")
-            start_epoch = load_checkpoint(model, optimizer, latest)
-            start_epoch += 1
+            start_epoch, _ = load_training_checkpoint(
+                model, optimizer, latest, map_location="cpu", strict=True, scheduler=scheduler
+            )
+
     
     best_val_loss = float('inf')
     train_losses = []
@@ -180,168 +197,200 @@ def finetune_model(
     for epoch in range(start_epoch, n_epochs):
         # === TREINO ===
         model.train()
-        train_loss_epoch = 0
+        train_loss_epoch = 0.0
         train_count = 0
-        
+
         print(f"\n🔄 Fine-tune Época {epoch+1}/{n_epochs} - Cidade {target_city}")
-        
         train_pbar = tqdm(train_loader, desc=f'Finetune {target_city}')
-        
+
         for batch_idx, batch in enumerate(train_pbar):
             try:
                 uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, target_coords = [
                     b.to(device) for b in batch
                 ]
-                
-                if not torch.isfinite(coords_seq).all() or not torch.isfinite(target_coords).all():
+
+                # sanity checks mínimos
+                if (not torch.isfinite(coords_seq).all()) or (not torch.isfinite(target_coords).all()):
                     continue
-                
+
                 optimizer.zero_grad(set_to_none=True)
-                
-                pred = model.forward_single_step(
-                    uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq
-                )
+
+                pred = model.forward_single_step(uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq)
                 target = target_coords.squeeze(1)
-                
+
                 if not torch.isfinite(pred).all():
                     continue
-                
+
                 loss = criterion(pred, target)
-                
                 if not torch.isfinite(loss):
                     continue
-                
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
                 optimizer.step()
-                
-                train_loss_epoch += loss.item() * target.size(0)
-                train_count += target.size(0)
-                
+
+                bs = target.size(0)
+                train_loss_epoch += float(loss.item()) * bs
+                train_count += bs
+
                 if batch_idx % 50 == 0:
                     train_pbar.set_postfix({
                         'Loss': f'{loss.item():.5f}',
                         'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
                     })
-                    
+
             except Exception as e:
                 print(f"⚠️ Erro batch {batch_idx}: {e}")
                 continue
-        
+
         # === VALIDAÇÃO ===
         model.eval()
-        val_loss_epoch = 0
+        val_loss_epoch = 0.0
         val_count = 0
-        
+
         with torch.no_grad():
             for batch in tqdm(val_loader, desc='Val'):
                 try:
                     uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, target_coords = [
                         b.to(device) for b in batch
                     ]
-                    
-                    pred = model.forward_single_step(
-                        uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq
-                    )
+                    pred = model.forward_single_step(uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq)
                     target = target_coords.squeeze(1)
-                    
-                    loss = criterion(pred, target)
-                    val_loss_epoch += loss.item() * target.size(0)
-                    val_count += target.size(0)
-                    
-                except Exception as e:
-                    continue
-        
-        # Calcula médias ANTES de usar
-        avg_train_loss = train_loss_epoch / max(train_count, 1)
-        avg_val_loss = val_loss_epoch / max(val_count, 1)
+                    vloss = criterion(pred, target)
 
+                    bs = target.size(0)
+                    val_loss_epoch += float(vloss.item()) * bs
+                    val_count += bs
+                except Exception:
+                    continue
+
+        # === MÉDIAS ===
+        avg_train_loss = train_loss_epoch / max(train_count, 1)
+        avg_val_loss   = val_loss_epoch   / max(val_count,   1)
+
+        # Early stopping
         stopper.update(avg_val_loss)
         if stopper.should_stop:
-            print(f"⏹️ Early stopping em {target_city}: sem melhoria por {stopper.patience} épocas (best={stopper.best:.5f})")
+            print(f"ℹ️ Early stopping em {target_city}: sem melhoria por {stopper.patience} épocas (best={stopper.best:.5f})")
             break
-        
+
         train_losses.append(avg_train_loss)
         val_losses.append(avg_val_loss)
-        
-        # Pesos da fusão
-        w_r = model.weighted_fusion.w_r.item()
-        w_e = model.weighted_fusion.w_e.item()
-        fusion_weights = {"w_r": w_r, "w_e": w_e}
-        fusion_weights_history.append(fusion_weights)
-        
+
+        # Pesos de fusão (escalares)
+        w_r = float(model.weighted_fusion.w_r.item())
+        w_e = float(model.weighted_fusion.w_e.item())
+        fusion_weights_history.append({"w_r": w_r, "w_e": w_e})
+
         print(f"Cidade {target_city} - Treino: {avg_train_loss:.5f} | Val: {avg_val_loss:.5f}")
-        
-        
-        # Checkpoint
+
+        # CORREÇÃO B: Checkpoint condicional usando checkpoint_every_n_epochs
         if (epoch + 1) % checkpoint_every_n_epochs == 0:
-            save_checkpoint(
+            ckpt_path = save_checkpoint(
                 model=model,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 epoch=epoch,
                 val_loss=avg_val_loss,
                 save_dir=checkpoint_dir,
-                filename=f"checkpoint_epoch_{epoch+1}.pt",
+                filename=f"checkpoint_epoch_{epoch+1:03d}.pt",
                 extra_data={
-                    'centers': centers.cpu().numpy(),
-                    'config': config,
-                    'city': target_city,
-                    'finetuned_from': pretrained_checkpoint
-                }
+                    'centers': centers.detach().cpu(),     # tensor, não numpy
+                    'config':  config,
+                    'city':    str(target_city),
+                    'finetuned_from': str(pretrained_checkpoint),
+                },
             )
-        
-        # MLflow logging
-        if mlflow_tracker is not None:
-            mlflow_tracker.log_training_metrics(
-                epoch=epoch,
-                train_loss=avg_train_loss,
-                val_loss=avg_val_loss,
-                fusion_w_r=w_r,       # <- NÃO passe dict
-                fusion_w_e=w_e,
-                learning_rate=optimizer.param_groups[0]["lr"]
-            )
+            cleanup_old_checkpoints(checkpoint_dir, keep_last=3, pattern="checkpoint_epoch_*.pt")
 
-        # Update scheduler
-        scheduler.step()
-        
-        # Salva se melhorou
+            # === MLflow (não pode derrubar treino) ===
+            try:
+                if mlflow_tracker is not None:
+                    mlflow_tracker.log_model_artifact(
+                        model, ckpt_path, artifact_path=f"finetune_{target_city}/checkpoints"
+                    )
+                    mlflow_tracker.log_training_metrics(
+                        step=epoch,
+                        train_loss=float(avg_train_loss),
+                        val_loss=float(avg_val_loss),
+                        lr=float(optimizer.param_groups[0]["lr"]),
+                        fusion_w_r=w_r,
+                        fusion_w_e=w_e,
+                    )
+            except Exception as e:
+                print(f"[MLflow] logging ignorado: {e}")
+
+        # === Scheduler UMA vez por época ===
+        if scheduler is not None:
+            scheduler.step()
+
+        # === Best model ===
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            
             if save_path is None:
                 save_path = f"humob_model_finetuned_{target_city}.pt"
-            
+
             print(f"💾 Novo melhor modelo para {target_city}! Loss: {best_val_loss:.5f}")
-            
+
             torch.save({
-                'state_dict': model.state_dict(),
-                'centers': centers.cpu().numpy(),
-                'config': config,
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'epoch': epoch,
-                'city': target_city,
-                'finetuned_from': pretrained_checkpoint,
-                'timestamp': datetime.now().isoformat(),
-                'mlflow_run_id': ft_run_id  # ✅ Agora sempre definido
+                'model_state_dict': model.state_dict(),
+                'extra': {
+                    'centers': centers.detach().cpu(),
+                    'config': {
+                        **config,
+                        'sequence_length': sequence_length,  # garante consistência
+                    },
+                    'train_loss': float(avg_train_loss),
+                    'val_loss': float(avg_val_loss),
+                    'epoch': int(epoch),
+                    'city': str(target_city),
+                    'finetuned_from': str(pretrained_checkpoint),
+                }
             }, save_path)
-            
-            if mlflow_tracker is not None:
-                mlflow_tracker.log_model_artifact(model, save_path)
+
+            try:
+                if mlflow_tracker is not None:
+                    mlflow_tracker.log_model_artifact(
+                        model, save_path, artifact_path=f"finetune_{target_city}/best"
+                    )
+            except Exception as e:
+                print(f"[MLflow] log best ignorado: {e}")
+
+    # CORREÇÃO C: DEDENT - Tudo abaixo sai do loop de épocas
+    # --- FIM DO LOOP DE ÉPOCAS ---
     
-    # MLflow plots
-    if mlflow_tracker is not None:
-        mlflow_tracker.create_training_plots(
-            train_losses=train_losses,
-            val_losses=val_losses,
-            fusion_weights_history=fusion_weights_history
-        )
-    
+    # Último checkpoint (se existir)
+    last_ckpt_path = get_latest_checkpoint(checkpoint_dir, pattern="checkpoint_epoch_*.pt")
+
+    # Plots/artefatos no MLflow (se seu tracker tiver esse método)
+    if mlflow_tracker is not None and hasattr(mlflow_tracker, "create_training_plots"):
+        try:
+            mlflow_tracker.create_training_plots(
+                train_losses=train_losses,
+                val_losses=val_losses,
+                fusion_weights_history=fusion_weights_history
+            )
+        except Exception as e:
+            print(f"[MLflow] plots ignorados: {e}")
+
+    # Fechar o run do MLflow deste fine-tune
+    if mlflow_tracker is not None and hasattr(mlflow_tracker, "end_run"):
+        try:
+            mlflow_tracker.end_run()
+        except Exception as e:
+            print(f"[MLflow] end_run ignorado: {e}")
+
+    # Resumo
     print(f"\n✅ Fine-tuning cidade {target_city} concluído!")
-    print(f"💾 Modelo salvo: {save_path}")
-    print(f"📈 Melhor loss: {best_val_loss:.5f}")
-    
+    if save_path is not None:
+        print(f"💾 Melhor modelo: {save_path}")
+    if last_ckpt_path is not None:
+        print(f"🧩 Último checkpoint: {last_ckpt_path}")
+    print(f"📈 Melhor val loss: {best_val_loss:.5f}")
+
     return model, train_losses, val_losses
+
+
 
 
 def sequential_finetuning(
