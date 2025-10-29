@@ -272,17 +272,8 @@ def finetune_model(
         
         print(f"Cidade {target_city} - Treino: {avg_train_loss:.5f} | Val: {avg_val_loss:.5f}")
         
-        # MLflow logging
-        if mlflow_tracker is not None:
-            mlflow_tracker.log_training_metrics(
-                epoch=epoch,
-                train_loss=avg_train_loss,
-                val_loss=avg_val_loss,
-                fusion_weights=fusion_weights,
-                learning_rate=optimizer.param_groups[0]["lr"]
-            )
         
-        # Checkpoint COM INDENTAÇÃO CORRETA (dentro do for epoch)
+        # Checkpoint
         if (epoch + 1) % checkpoint_every_n_epochs == 0:
             save_checkpoint(
                 model=model,
@@ -299,6 +290,17 @@ def finetune_model(
                 }
             )
         
+        # MLflow logging
+        if mlflow_tracker is not None:
+            mlflow_tracker.log_training_metrics(
+                epoch=epoch,
+                train_loss=avg_train_loss,
+                val_loss=avg_val_loss,
+                fusion_w_r=w_r,       # <- NÃO passe dict
+                fusion_w_e=w_e,
+                learning_rate=optimizer.param_groups[0]["lr"]
+            )
+
         # Update scheduler
         scheduler.step()
         

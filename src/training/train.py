@@ -356,16 +356,6 @@ def train_humob_model(
         print(f"Treino: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}")
         print(f"Fusion weights: w_r={w_r:.3f}, w_e={w_e:.3f}")
         
-        # MLflow logging
-        if mlflow_tracker is not None:
-            mlflow_tracker.log_training_metrics(
-                epoch=epoch,
-                train_loss=avg_train_loss,
-                val_loss=avg_val_loss,
-                fusion_weights=fusion_weights,
-                grad_norm=post_clip_norm,
-                learning_rate=optimizer.param_groups[0]["lr"]
-            )
         
         # Salva a cada N épocas
         if (epoch + 1) % checkpoint_every_n_epochs == 0:
@@ -390,6 +380,18 @@ def train_humob_model(
                 }
             )
             
+        # MLflow logging
+        if mlflow_tracker is not None:
+            mlflow_tracker.log_training_metrics(
+                epoch=epoch,
+                train_loss=avg_train_loss,
+                val_loss=avg_val_loss,
+                fusion_w_r=w_r,       # <- NÃO passe dict
+                fusion_w_e=w_e,
+                grad_norm=post_clip_norm,
+                learning_rate=optimizer.param_groups[0]["lr"]
+            )
+
             # Remove checkpoints antigos
             _cleanup_old_checkpoints(keep_last_n_checkpoints)
 

@@ -195,6 +195,34 @@ class HuMobMLflowTracker:
         except Exception:
             pass
 
+    # dentro da classe HuMobMLflowTracker
+    def log_model_artifact(self, model, file_path: str, artifact_path: str = "models", also_log_mlflow_model: bool = False):
+        import os, mlflow
+        if not os.path.exists(file_path):
+            print(f"[MLflow] ⚠️ Arquivo não encontrado: {file_path} (ignorando)")
+            return
+        try:
+            # garante um run ativo
+            if mlflow.active_run() is None:
+                if self.run_id:
+                    mlflow.start_run(run_id=self.run_id)
+                else:
+                    run = mlflow.start_run(run_name=f"artifact-{_ts()}", nested=True)
+                    self.run_id = run.info.run_id
+
+            mlflow.log_artifact(file_path, artifact_path=artifact_path)
+
+            if also_log_mlflow_model:
+                try:
+                    import mlflow.pytorch as mpt
+                    mpt.log_model(model, artifact_path=f"{artifact_path}/mlflow_model")
+                except Exception as e:
+                    print(f"[MLflow] (opcional) log_model falhou: {e}")
+        except Exception as e:
+            print(f"[MLflow] ⚠️ Falha ao logar artefato '{file_path}': {e}")
+
+
+
     # ------------- plots (placeholders seguros) -
 
     def create_training_plots(self, **_: Any) -> None:
