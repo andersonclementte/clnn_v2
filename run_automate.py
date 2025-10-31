@@ -185,11 +185,16 @@ def run_from_yaml(cfg_path: str) -> None:
 
     if do_submit:
         print("\n📄 Gerando submissão final")
-        # escolha o último FT bem-sucedido (ou mantenha o base)
-        final_ckpt = next((res["checkpoint"] for city,res in reversed(list(results.items()))
-                           if res.get("status") == "success"), base_ckpt.as_posix())
+
+        # pega o último FT bem-sucedido; senão usa o base
+        final_ckpt = next(
+            (res["checkpoint"] for _, res in reversed(list(results.items()))
+            if res.get("status") == "success"),
+            base_ckpt.as_posix(),
+        )
+
         sub_path = Path(submissions_dir) / "humob_submission.csv"
-        df = generate_humob_submission(
+        out = generate_humob_submission(
             parquet_path=parquet_path,
             checkpoint_path=final_ckpt,
             device=device,
@@ -197,12 +202,16 @@ def run_from_yaml(cfg_path: str) -> None:
             submission_days=submission_days,
             sequence_length=seq_len,
             output_file=sub_path.as_posix(),
+            # opcionais (se quiser controlar pelo YAML):
+            # chunk_size=50_000,
+            # users_batch=512,
         )
-        print(f"   ✅ Submissão gerada: {sub_path.name} ({len(df):,} linhas)")
+        print(f"   ✅ Submissão gerada: {sub_path.name} ({out['rows']:,} linhas, {out['users']:,} usuários)")
     else:
         print("📄 Submissão desativada pelo YAML")
 
     print("\n🎉 FIM — pipeline concluído.")
+
 
 
 if __name__ == "__main__":

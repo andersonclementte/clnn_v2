@@ -168,174 +168,190 @@ def run_full_pipeline(
         'checkpoint_path': 'humob_model_A.pt'
     }
 
-
 def generate_humob_submission(
     parquet_path: str,
     checkpoint_path: str,
     device: torch.device,
     target_cities: list[str] = ["B", "C", "D"],
-    submission_days: tuple = (61, 75),  # Dias 61-75 para HuMob
-    sequence_length: int = 24,
+    submission_days: tuple = (61, 75),
+    sequence_length: int = 24,          # fallback se não houver no ckpt
     output_file: str = "humob_submission.csv",
-    chunk_size: int = 1000
+    chunk_size: int = 50_000,           # tamanho do flush para disco
+    users_batch: int = 512              # tamanho do lote de usuários na GPU
 ):
     """
-    Gera arquivo de submissão para o HuMob Challenge.
-    
-    Formato esperado: uid, day, slot, x, y
-    onde x,y são coordenadas discretas [0,199]
+    Gera submissão HuMob (uid, day, slot, x, y) de forma eficiente (streaming).
     """
-    print(f"📄 Gerando submissão HuMob para cidades {target_cities}")
-    print(f"Dias: {submission_days[0]}-{submission_days[1]} | Output: {output_file}")
-    
-    # 1. Carrega modelo
-    import numpy as np, torch
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    centers = torch.from_numpy(ckpt['centers']).to(device)
-    config = ckpt['config']
-    
+    print(f"📄 Gerando submissão HuMob para {target_cities} | dias {submission_days[0]}-{submission_days[1]}")
+    import math, gc
+    import torch
+    import numpy as np
+    import pandas as pd
+    from tqdm import tqdm
+
+    # ---------- 1) Carrega checkpoint (compatível com layouts novo/antigo)
+    try:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(checkpoint_path, map_location=device)
+
+    centers_obj = ckpt.get("centers", None) or ckpt.get("extra", {}).get("centers", None)
+    if centers_obj is None:
+        raise RuntimeError("Centers não encontrados no checkpoint (nem em 'centers' nem em 'extra.centers').")
+    centers = centers_obj.to(device) if isinstance(centers_obj, torch.Tensor) \
+             else torch.as_tensor(centers_obj, dtype=torch.float32, device=device)
+
+    cfg   = ckpt.get("config", ckpt.get("extra", {}).get("config", {}))
+    state = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
+    seq_len_ckpt = int(cfg.get("sequence_length", sequence_length))
+
     model = HuMobModel(
-        n_users=config['n_users'],
-        n_cities=config['n_cities'], 
+        n_users=int(cfg.get("n_users", 100_000)),
+        n_cities=int(cfg.get("n_cities", 4)),
         cluster_centers=centers,
-        sequence_length=sequence_length,
-        prediction_steps=1
+        sequence_length=seq_len_ckpt,
+        prediction_steps=int(cfg.get("prediction_steps", 1)),
     ).to(device)
-    
-    model.load_state_dict(ckpt['state_dict'])
+    model.load_state_dict(state, strict=True)
     model.eval()
-    
-    # 2. Processa dados para submissão
-    submission_rows = []
-    
-    # Cria dataset para dias observados (para construir histórico)
+
+    # ---------- 2) Varredura leve: só a última sequência por usuário
+    print("🔄 Coletando ÚLTIMA sequência por usuário (streaming)...")
+    last_seq_by_uid: dict[int, dict] = {}
+
     observed_ds = HuMobNormalizedDataset(
         parquet_path=parquet_path,
         cities=target_cities,
-        mode="test",  # Usa todos os dados disponíveis
-        sequence_length=sequence_length,
-        max_sequences_per_user=float('inf')  # Sem limitação
+        mode="test",                   # usa tudo disponível
+        sequence_length=seq_len_ckpt,
+        max_sequences_per_user=float('inf')
     )
-    
-    # Agrupa por usuário para fazer rollout sequencial
-    user_sequences = {}
-    print("🔄 Coletando sequências por usuário...")
-    
-    for sample in tqdm(observed_ds):
-        uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, target_coords = sample
-        uid_int = uid.item()
-        
-        if uid_int not in user_sequences:
-            user_sequences[uid_int] = []
-        
-        user_sequences[uid_int].append({
-            'd_norm': d_norm.item(),
-            't_sin': t_sin.item(), 
-            't_cos': t_cos.item(),
-            'city': city.item(),
-            'poi_norm': poi_norm.numpy(),
-            'coords_seq': coords_seq.numpy(),
-            'last_observed_day': d_norm.item() * 74,  # Desnormaliza
-            'last_observed_slot': np.arctan2(t_sin.item(), t_cos.item()) / (2*np.pi) * 48
-        })
-    
-    print(f"📊 Encontrados {len(user_sequences)} usuários únicos")
-    
-    # 3. Gera predições para cada usuário
-    print("🎯 Gerando predições...")
-    
-    with torch.no_grad():
-        for uid_int, sequences in tqdm(user_sequences.items()):
-            if not sequences:
-                continue
-                
-            # Pega a sequência mais recente como base
-            latest_seq = max(sequences, key=lambda x: x['d_norm'])
-            
-            # Converte para tensors
-            uid_tensor = torch.tensor([uid_int], dtype=torch.long, device=device)
-            city_tensor = torch.tensor([latest_seq['city']], dtype=torch.long, device=device)
-            poi_tensor = torch.tensor([latest_seq['poi_norm']], dtype=torch.float32, device=device)
-            coords_seq_tensor = torch.tensor([latest_seq['coords_seq']], dtype=torch.float32, device=device)
-            
-            # Estado temporal inicial (último ponto observado)
-            d_norm = torch.tensor([latest_seq['d_norm']], dtype=torch.float32, device=device)
-            t_sin = torch.tensor([latest_seq['t_sin']], dtype=torch.float32, device=device)  
-            t_cos = torch.tensor([latest_seq['t_cos']], dtype=torch.float32, device=device)
-            
-            # Calcula quantos passos até chegar no dia 61
-            last_day = int(latest_seq['last_observed_day'])
-            last_slot = int(latest_seq['last_observed_slot']) 
-            
-            # Rollout até o dia 75, slot 47
-            current_day = max(last_day, submission_days[0])  # Começa no dia 61
-            current_slot = 0
-            
-            # Total de predições necessárias
-            total_slots = (submission_days[1] - submission_days[0] + 1) * 48
-            
+
+    for sample in tqdm(observed_ds, desc="scan"):
+        uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, _ = sample
+        uid_int = int(uid.item())
+        dn = float(d_norm.item())
+
+        # slot a partir de seno/cosseno
+        angle = math.atan2(float(t_sin.item()), float(t_cos.item()))     # [-π, π]
+        angle = (angle + 2*math.pi) % (2*math.pi)                        # [0, 2π)
+        last_slot = int(round(angle / (2*math.pi) * 48)) % 48
+
+        cur = last_seq_by_uid.get(uid_int)
+        if (cur is None) or (dn > cur["d_norm"]):
+            last_seq_by_uid[uid_int] = {
+                "d_norm": dn,
+                "t_sin": float(t_sin.item()),
+                "t_cos": float(t_cos.item()),
+                "city": int(city.item()),
+                "poi_norm": poi_norm.detach().cpu().numpy(),
+                "coords_seq": coords_seq.detach().cpu().numpy(),
+                "last_observed_day": float(dn * 74),
+                "last_observed_slot": last_slot,
+            }
+
+    n_users = len(last_seq_by_uid)
+    print(f"📊 Usuários únicos coletados: {n_users:,}")
+
+    # ---------- 3) Escrita incremental de CSV
+    submission_rows = []
+    first_chunk = True
+    total_rows  = 0
+
+    def flush_rows():
+        nonlocal submission_rows, first_chunk, total_rows
+        if not submission_rows:
+            return
+        df_chunk = pd.DataFrame(submission_rows).sort_values(["uid","day","slot"])
+        df_chunk.to_csv(output_file, index=False,
+                        mode=("w" if first_chunk else "a"),
+                        header=first_chunk)
+        total_rows += len(df_chunk)
+        submission_rows.clear()
+        first_chunk = False
+
+    # ---------- 4) Inferência em lote por usuários
+    uids = list(last_seq_by_uid.keys())
+    total_slots = (submission_days[1] - submission_days[0] + 1) * 48
+    print(f"🚀 Inferindo em lotes de {users_batch} usuários • total_slots={total_slots}")
+
+    with torch.inference_mode():
+        for i in tqdm(range(0, n_users, users_batch), desc="infer"):
+            batch_ids = uids[i:i+users_batch]
+            batch = [last_seq_by_uid[u] for u in batch_ids]
+
+            city_tensor = torch.as_tensor(np.asarray([b["city"] for b in batch], dtype=np.int64), device=device)
+            uid_tensor  = torch.as_tensor(np.asarray(batch_ids, dtype=np.int64), device=device)
+            poi_arr   = np.ascontiguousarray(np.stack([b["poi_norm"]  for b in batch], axis=0), dtype=np.float32)
+            coords_arr= np.ascontiguousarray(np.stack([b["coords_seq"] for b in batch], axis=0), dtype=np.float32)
+            poi_tensor   = torch.from_numpy(poi_arr)
+            coords_seq_t = torch.from_numpy(coords_arr)
+
+            # Transferência para GPU
+            if device.type == "cuda":
+                poi_tensor   = poi_tensor.pin_memory().to(device, non_blocking=True)
+                coords_seq_t = coords_seq_t.pin_memory().to(device, non_blocking=True)
+            else:
+                poi_tensor   = poi_tensor.to(device)
+                coords_seq_t = coords_seq_t.to(device)
+
+            current_day_vec  = torch.full((len(batch_ids),), submission_days[0],
+                              dtype=torch.long, device=device)
+            current_slot_vec = torch.zeros_like(current_day_vec)
+
+
             for step in range(total_slots):
-                # Atualiza estado temporal 
-                d_norm_current = torch.tensor([current_day / 74.0], device=device)
-                t_sin_current = torch.sin(torch.tensor([2 * np.pi * current_slot / 48], device=device))
-                t_cos_current = torch.cos(torch.tensor([2 * np.pi * current_slot / 48], device=device))
-                
-                # Predição
-                try:
-                    pred_coords = model.forward_single_step(
-                        uid_tensor, d_norm_current, t_sin_current, t_cos_current,
-                        city_tensor, poi_tensor, coords_seq_tensor
-                    )
-                    
-                    # Discretiza coordenadas
-                    pred_discrete = discretize_coordinates(pred_coords, grid_size=200)
-                    x, y = pred_discrete[0, 0].item(), pred_discrete[0, 1].item()
-                    
-                    # Adiciona à submissão
+                d_norm_current = (current_day_vec.float() / 74.0)
+                phase = 2 * torch.pi * (current_slot_vec.float() / 48.0)
+                t_sin_current = torch.sin(phase)
+                t_cos_current = torch.cos(phase)
+
+                pred = model.forward_single_step(
+                    uid_tensor, d_norm_current, t_sin_current, t_cos_current,
+                    city_tensor, poi_tensor, coords_seq_t
+                )
+
+                # discretização (ajuste grid_size se sua função aceitar)
+                pred_disc = discretize_coordinates(pred)
+
+                # acumula linhas
+                for j, u in enumerate(batch_ids):
+                    city_id = int(city_tensor[j].item())
                     submission_rows.append({
-                        'uid': uid_int,
-                        'day': current_day,
-                        'slot': current_slot,
-                        'x': x,
-                        'y': y
+                        "uid": int(u),
+                        "city": city_id,
+                        "day": int(current_day_vec[j].item()),
+                        "slot": int(current_slot_vec[j].item()),
+                        "x": int(pred_disc[j, 0].item()),
+                        "y": int(pred_disc[j, 1].item()),
                     })
-                    
-                    # Atualiza sequência para próxima predição (teacher forcing)
-                    new_point = pred_coords.unsqueeze(1)  # (1, 1, 2)
-                    coords_seq_tensor = torch.cat([coords_seq_tensor[:, 1:, :], new_point], dim=1)
-                    
-                except Exception as e:
-                    print(f"❌ Erro predizindo usuário {uid_int}, dia {current_day}, slot {current_slot}: {e}")
-                    # Fallback: repete última posição conhecida
-                    x, y = int(coords_seq_tensor[0, -1, 0] * 199), int(coords_seq_tensor[0, -1, 1] * 199)
-                    submission_rows.append({
-                        'uid': uid_int, 'day': current_day, 'slot': current_slot, 'x': x, 'y': y
-                    })
-                
-                # Avança para próximo slot/dia
-                current_slot += 1
-                if current_slot >= 48:
-                    current_slot = 0
-                    current_day += 1
-                    
-                if current_day > submission_days[1]:
-                    break
-    
-    # 4. Salva submissão
-    df_submission = pd.DataFrame(submission_rows)
-    df_submission = df_submission.sort_values(['uid', 'day', 'slot'])
-    
-    print(f"📊 Submissão gerada:")
-    print(f"   Linhas: {len(df_submission):,}")
-    print(f"   Usuários únicos: {df_submission['uid'].nunique():,}")
-    print(f"   Dias: {df_submission['day'].min()}-{df_submission['day'].max()}")
-    print(f"   Coordenadas x: [{df_submission['x'].min()}, {df_submission['x'].max()}]")
-    print(f"   Coordenadas y: [{df_submission['y'].min()}, {df_submission['y'].max()}]")
-    
-    df_submission.to_csv(output_file, index=False)
+
+                # teacher forcing batelado
+                new_points = pred.clamp(0.0, 1.0).unsqueeze(1)   # [B,1,2]
+                coords_seq_t = torch.cat([coords_seq_t[:, 1:, :], new_points], dim=1)
+
+                # avança tempo
+                current_slot_vec += 1
+                rolled = current_slot_vec >= 48
+                current_slot_vec[rolled] = 0
+                current_day_vec[rolled] += 1
+
+                if len(submission_rows) >= chunk_size:
+                    flush_rows()
+
+            # limpeza por lote
+            del uid_tensor, city_tensor, poi_tensor, coords_seq_t
+            del current_day_vec, current_slot_vec, pred, pred_disc, new_points
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    # último flush
+    flush_rows()
+
     print(f"💾 Submissão salva em: {output_file}")
-    
-    return df_submission
+    print(f"   Linhas escritas: {total_rows:,} • Usuários: {n_users:,}")
+    return {"path": output_file, "rows": total_rows, "users": n_users}
+
 
 
 # Função principal de execução

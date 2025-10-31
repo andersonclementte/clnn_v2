@@ -33,7 +33,7 @@ eval:
   n_samples: 200        # comparação rápida
 
 submission:
-  enabled: false
+  enabled: True
 
 outputs:
   models_path: "outputs/models/"
