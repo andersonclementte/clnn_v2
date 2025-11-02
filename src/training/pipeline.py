@@ -217,7 +217,8 @@ def generate_humob_submission(
 
     # ---------- 2) Varredura leve: só a última sequência por usuário
     print("🔄 Coletando ÚLTIMA sequência por usuário (streaming)...")
-    last_seq_by_uid: dict[int, dict] = {}
+    # last_seq_by_uid: dict[int, dict] = {}
+    last_seq_by_key: dict[tuple[int, int], dict] = {}  # (city_id, uid) -> última seq
 
     observed_ds = HuMobNormalizedDataset(
         parquet_path=parquet_path,
@@ -229,7 +230,10 @@ def generate_humob_submission(
 
     for sample in tqdm(observed_ds, desc="scan"):
         uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, _ = sample
-        uid_int = int(uid.item())
+        # uid_int = int(uid.item())
+        uid_int  = int(uid.item())
+        city_id  = int(city.item())
+        key = (city_id, uid_int)
         dn = float(d_norm.item())
 
         # slot a partir de seno/cosseno
@@ -237,21 +241,35 @@ def generate_humob_submission(
         angle = (angle + 2*math.pi) % (2*math.pi)                        # [0, 2π)
         last_slot = int(round(angle / (2*math.pi) * 48)) % 48
 
-        cur = last_seq_by_uid.get(uid_int)
+        # cur = last_seq_by_uid.get(uid_int)
+        # if (cur is None) or (dn > cur["d_norm"]):
+        #     last_seq_by_uid[uid_int] = {
+        #         "d_norm": dn,
+        #         "t_sin": float(t_sin.item()),
+        #         "t_cos": float(t_cos.item()),
+        #         "city": int(city.item()),
+        #         "poi_norm": poi_norm.detach().cpu().numpy(),
+        #         "coords_seq": coords_seq.detach().cpu().numpy(),
+        #         "last_observed_day": float(dn * 74),
+        #         "last_observed_slot": last_slot,
+        #     }
+        cur = last_seq_by_key.get(key)
         if (cur is None) or (dn > cur["d_norm"]):
-            last_seq_by_uid[uid_int] = {
+            last_seq_by_key[key] = {
                 "d_norm": dn,
                 "t_sin": float(t_sin.item()),
                 "t_cos": float(t_cos.item()),
-                "city": int(city.item()),
+                "city":  city_id,
                 "poi_norm": poi_norm.detach().cpu().numpy(),
                 "coords_seq": coords_seq.detach().cpu().numpy(),
                 "last_observed_day": float(dn * 74),
                 "last_observed_slot": last_slot,
             }
 
-    n_users = len(last_seq_by_uid)
-    print(f"📊 Usuários únicos coletados: {n_users:,}")
+    # n_users = len(last_seq_by_uid)
+    # print(f"📊 Usuários únicos coletados: {n_users:,}")
+    n_users = len(last_seq_by_key)
+    print(f"📊 Pares (cidade, uid) coletados: {n_users:,}")
 
     # ---------- 3) Escrita incremental de CSV
     submission_rows = []
@@ -262,32 +280,48 @@ def generate_humob_submission(
         nonlocal submission_rows, first_chunk, total_rows
         if not submission_rows:
             return
-        df_chunk = pd.DataFrame(submission_rows).sort_values(["uid","day","slot"])
-        df_chunk.to_csv(output_file, index=False,
-                        mode=("w" if first_chunk else "a"),
-                        header=first_chunk)
+        df_chunk = (
+            pd.DataFrame(submission_rows)
+            .sort_values(["city", "uid", "day", "slot"])
+            [["uid", "city", "day", "slot", "x", "y"]]            # ordem fixa
+        )
+        df_chunk.to_csv(
+            output_file,
+            index=False,
+            mode=("w" if first_chunk else "a"),
+            header=first_chunk,
+        )
         total_rows += len(df_chunk)
         submission_rows.clear()
         first_chunk = False
 
+
     # ---------- 4) Inferência em lote por usuários
-    uids = list(last_seq_by_uid.keys())
+    # uids = list(last_seq_by_uid.keys())
+    pairs = list(last_seq_by_key.keys())  # lista de (city_id, uid)
     total_slots = (submission_days[1] - submission_days[0] + 1) * 48
     print(f"🚀 Inferindo em lotes de {users_batch} usuários • total_slots={total_slots}")
 
     with torch.inference_mode():
         for i in tqdm(range(0, n_users, users_batch), desc="infer"):
-            batch_ids = uids[i:i+users_batch]
-            batch = [last_seq_by_uid[u] for u in batch_ids]
+            # --- dentro do loop por lotes ---
+            batch_pairs = pairs[i:i+users_batch]                  # [(city_id, uid), ...]
+            batch = [last_seq_by_key[p] for p in batch_pairs]
 
-            city_tensor = torch.as_tensor(np.asarray([b["city"] for b in batch], dtype=np.int64), device=device)
-            uid_tensor  = torch.as_tensor(np.asarray(batch_ids, dtype=np.int64), device=device)
-            poi_arr   = np.ascontiguousarray(np.stack([b["poi_norm"]  for b in batch], axis=0), dtype=np.float32)
-            coords_arr= np.ascontiguousarray(np.stack([b["coords_seq"] for b in batch], axis=0), dtype=np.float32)
+            # vetores (NumPy -> tensor) para uid/city
+            uid_arr  = np.asarray([p[1] for p in batch_pairs], dtype=np.int64)
+            city_arr = np.asarray([p[0] for p in batch_pairs], dtype=np.int64)
+            uid_tensor  = torch.as_tensor(uid_arr,  device=device)
+            city_tensor = torch.as_tensor(city_arr, device=device)
+
+            # poi / coords (stack mais rápido)
+            poi_arr    = np.ascontiguousarray(np.stack([b["poi_norm"]  for b in batch], axis=0), dtype=np.float32)
+            coords_arr = np.ascontiguousarray(np.stack([b["coords_seq"] for b in batch], axis=0), dtype=np.float32)
+            # poi_tensor   = torch.from_numpy(poi_arr).to(device, non_blocking=True)
+            # coords_seq_t = torch.from_numpy(coords_arr).to(device, non_blocking=True)
             poi_tensor   = torch.from_numpy(poi_arr)
             coords_seq_t = torch.from_numpy(coords_arr)
 
-            # Transferência para GPU
             if device.type == "cuda":
                 poi_tensor   = poi_tensor.pin_memory().to(device, non_blocking=True)
                 coords_seq_t = coords_seq_t.pin_memory().to(device, non_blocking=True)
@@ -295,10 +329,12 @@ def generate_humob_submission(
                 poi_tensor   = poi_tensor.to(device)
                 coords_seq_t = coords_seq_t.to(device)
 
-            current_day_vec  = torch.full((len(batch_ids),), submission_days[0],
-                              dtype=torch.long, device=device)
-            current_slot_vec = torch.zeros_like(current_day_vec)
+            # tamanho do batch
+            B = uid_arr.shape[0]
 
+            # tempo inicial FIXO (dias 61–75)
+            current_day_vec  = torch.full((B,), submission_days[0], dtype=torch.long, device=device)
+            current_slot_vec = torch.zeros(B, dtype=torch.long, device=device)
 
             for step in range(total_slots):
                 d_norm_current = (current_day_vec.float() / 74.0)
@@ -310,24 +346,21 @@ def generate_humob_submission(
                     uid_tensor, d_norm_current, t_sin_current, t_cos_current,
                     city_tensor, poi_tensor, coords_seq_t
                 )
-
-                # discretização (ajuste grid_size se sua função aceitar)
                 pred_disc = discretize_coordinates(pred)
 
-                # acumula linhas
-                for j, u in enumerate(batch_ids):
-                    city_id = int(city_tensor[j].item())
+                # acumula linhas (usa arrays, não batch_ids)
+                for j in range(B):
                     submission_rows.append({
-                        "uid": int(u),
-                        "city": city_id,
-                        "day": int(current_day_vec[j].item()),
+                        "uid":  int(uid_arr[j]),
+                        "city": int(city_arr[j]),
+                        "day":  int(current_day_vec[j].item()),
                         "slot": int(current_slot_vec[j].item()),
-                        "x": int(pred_disc[j, 0].item()),
-                        "y": int(pred_disc[j, 1].item()),
+                        "x":    int(pred_disc[j, 0].item()),
+                        "y":    int(pred_disc[j, 1].item()),
                     })
 
                 # teacher forcing batelado
-                new_points = pred.clamp(0.0, 1.0).unsqueeze(1)   # [B,1,2]
+                new_points = pred.clamp(0.0, 1.0).unsqueeze(1)  # [B,1,2]
                 coords_seq_t = torch.cat([coords_seq_t[:, 1:, :], new_points], dim=1)
 
                 # avança tempo
@@ -349,7 +382,8 @@ def generate_humob_submission(
     flush_rows()
 
     print(f"💾 Submissão salva em: {output_file}")
-    print(f"   Linhas escritas: {total_rows:,} • Usuários: {n_users:,}")
+    # print(f"   Linhas escritas: {total_rows:,} • Usuários: {n_users:,}")
+    print(f"   Linhas escritas: {total_rows:,} • Pares (cidade, uid): {n_users:,}")
     return {"path": output_file, "rows": total_rows, "users": n_users}
 
 
