@@ -175,12 +175,13 @@ def generate_humob_submission(
     target_cities: list[str] = ["B", "C", "D"],
     submission_days: tuple = (61, 75),
     sequence_length: int = 24,          # fallback se não houver no ckpt
-    output_file: str = "humob_submission.csv",
-    chunk_size: int = 50_000,           # tamanho do flush para disco
+    # output_file: str = "humob_submission.csv",
+    output_file: str = "outputs/submissions/humob_submission.parquet",
+    chunk_size: int = 500_000,           # tamanho do flush para disco
     users_batch: int = 512              # tamanho do lote de usuários na GPU
 ):
     """
-    Gera submissão HuMob (uid, day, slot, x, y) de forma eficiente (streaming).
+    Gera submissão HuMob (uid, city, day, slot, x, y) de forma eficiente (streaming).
     """
     print(f"📄 Gerando submissão HuMob para {target_cities} | dias {submission_days[0]}-{submission_days[1]}")
     import math, gc
@@ -272,35 +273,77 @@ def generate_humob_submission(
     print(f"📊 Pares (cidade, uid) coletados: {n_users:,}")
 
     # ---------- 3) Escrita incremental de CSV
+    # total_rows  = 0
+
+    # def flush_rows():
+    #     nonlocal submission_rows, first_chunk, total_rows
+    #     if not submission_rows:
+    #         return
+    #     df_chunk = (
+    #         pd.DataFrame(submission_rows)
+    #         .sort_values(["city", "uid", "day", "slot"])
+    #         [["uid", "city", "day", "slot", "x", "y"]]            # ordem fixa
+    #     )
+    #     df_chunk.to_csv(
+    #         output_file,
+    #         index=False,
+    #         mode=("w" if first_chunk else "a"),
+    #         header=first_chunk,
+    #     )
+    #     total_rows += len(df_chunk)
+    #     submission_rows.clear()
+    #     first_chunk = False
+    from pathlib import Path
+    import pyarrow as pa, pyarrow.parquet as pq
+
+    _parquet_schema = pa.schema([
+        ("uid",  pa.int64()),
+        ("city", pa.int32()),
+        ("day",  pa.int32()),
+        ("slot", pa.int32()),
+        ("x",    pa.int32()),
+        ("y",    pa.int32()),
+    ])
+
+    out_path = Path(output_file)
+    if out_path.suffix.lower() != ".parquet":
+        out_path = out_path.with_suffix(".parquet")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    writer = None
+    total_rows = 0
     submission_rows = []
-    first_chunk = True
-    total_rows  = 0
 
     def flush_rows():
-        nonlocal submission_rows, first_chunk, total_rows
+        nonlocal writer, total_rows, submission_rows
         if not submission_rows:
             return
-        df_chunk = (
-            pd.DataFrame(submission_rows)
-            .sort_values(["city", "uid", "day", "slot"])
-            [["uid", "city", "day", "slot", "x", "y"]]            # ordem fixa
-        )
-        df_chunk.to_csv(
-            output_file,
-            index=False,
-            mode=("w" if first_chunk else "a"),
-            header=first_chunk,
-        )
+        df_chunk = (pd.DataFrame(submission_rows)
+                    .sort_values(["city","uid","day","slot"])
+                    [["uid","city","day","slot","x","y"]])
+        table = pa.Table.from_pandas(df_chunk, schema=_parquet_schema, preserve_index=False)
+
+        # 1º uso: cria writer; próximos: reusa
+        if writer is None:
+            # dica: remova row_group_size aqui (ver passo 2)
+            writer = pq.ParquetWriter(out_path.as_posix(), _parquet_schema,
+                                    compression="zstd", use_dictionary=True)
+
+        writer.write_table(table)  # 1 row-group por flush
         total_rows += len(df_chunk)
         submission_rows.clear()
-        first_chunk = False
-
+        # sentinela de auditoria:
+        print(f"[flush] wrote {len(df_chunk):,} rows • total_rows={total_rows:,}")
 
     # ---------- 4) Inferência em lote por usuários
     # uids = list(last_seq_by_uid.keys())
     pairs = list(last_seq_by_key.keys())  # lista de (city_id, uid)
     total_slots = (submission_days[1] - submission_days[0] + 1) * 48
     print(f"🚀 Inferindo em lotes de {users_batch} usuários • total_slots={total_slots}")
+
+    slots = torch.arange(48, device=device).float()
+    phase_lut = 2*torch.pi*(slots/48.0)
+    sin_lut, cos_lut = torch.sin(phase_lut), torch.cos(phase_lut)
 
     with torch.inference_mode():
         for i in tqdm(range(0, n_users, users_batch), desc="infer"):
@@ -323,6 +366,7 @@ def generate_humob_submission(
             coords_seq_t = torch.from_numpy(coords_arr)
 
             if device.type == "cuda":
+                torch.cuda.empty_cache()
                 poi_tensor   = poi_tensor.pin_memory().to(device, non_blocking=True)
                 coords_seq_t = coords_seq_t.pin_memory().to(device, non_blocking=True)
             else:
@@ -336,11 +380,15 @@ def generate_humob_submission(
             current_day_vec  = torch.full((B,), submission_days[0], dtype=torch.long, device=device)
             current_slot_vec = torch.zeros(B, dtype=torch.long, device=device)
 
+            
+
             for step in range(total_slots):
                 d_norm_current = (current_day_vec.float() / 74.0)
-                phase = 2 * torch.pi * (current_slot_vec.float() / 48.0)
-                t_sin_current = torch.sin(phase)
-                t_cos_current = torch.cos(phase)
+                # phase = 2 * torch.pi * (current_slot_vec.float() / 48.0)
+                # t_sin_current = torch.sin(phase)
+                # t_cos_current = torch.cos(phase)
+                t_sin_current = sin_lut[current_slot_vec]
+                t_cos_current = cos_lut[current_slot_vec]
 
                 pred = model.forward_single_step(
                     uid_tensor, d_norm_current, t_sin_current, t_cos_current,
@@ -380,11 +428,241 @@ def generate_humob_submission(
 
     # último flush
     flush_rows()
+    # fecha com segurança
+    if writer is not None:
+        writer.close()
 
-    print(f"💾 Submissão salva em: {output_file}")
-    # print(f"   Linhas escritas: {total_rows:,} • Usuários: {n_users:,}")
-    print(f"   Linhas escritas: {total_rows:,} • Pares (cidade, uid): {n_users:,}")
-    return {"path": output_file, "rows": total_rows, "users": n_users}
+    print(f"💾 Submissão salva: {out_path}")
+    print(f"   Linhas: {total_rows:,}")
+    return {"path": out_path.as_posix(), "rows": total_rows, "users": n_users}
+
+
+# ------------------------------------------
+# Predição + Ground Truth → Parquet
+# ------------------------------------------
+from pathlib import Path
+import pyarrow as pa, pyarrow.parquet as pq
+
+def generate_pred_gt_parquet(
+    parquet_path: str,
+    checkpoint_path: str,
+    device: torch.device,
+    target_cities: list[str] = ["B", "C", "D"],
+    split: str = "test",                 # "val" ou "test"
+    day_range: tuple[int, int] | None = (61, 75),  # manter apenas passos cujo (day_next) esteja neste range; None = todos
+    sequence_length: int = 24,           # fallback se não houver no checkpoint
+    output_file: str = "outputs/eval/pred_gt_pairs.parquet",
+    batch_size: int = 2048,
+    chunk_size: int = 500_000,
+    grid_size: int = 200,
+):
+    """
+    Gera um Parquet com (predições e ground truth) 1-passo (n+1) para cada amostra.
+    Não grava métricas; você calcula depois (MSE normalizado, cell error, etc).
+    Colunas:
+      uid, city, day, slot, split, seq_len,
+      x_pred_norm, y_pred_norm, x_gt_norm, y_gt_norm,
+      x_pred, y_pred, x_gt, y_gt,
+      x_pred_cell, y_pred_cell, x_gt_cell, y_gt_cell
+    """
+
+    def _process_buffer(
+        buf,
+        *,
+        model,
+        device,
+        writer,
+        sin_lut,
+        cos_lut,
+        seq_len_ckpt: int,
+        split: str,
+        grid_size: int,
+        day_range: tuple[int, int] | None
+    ) -> int:
+        """Processa UM buffer (pode ser 'cheio' ou o resto), escreve no Parquet e retorna nº de linhas escritas."""
+        if not buf:
+            return 0
+
+        # 1) Empacota tensores
+        uid_t   = torch.as_tensor([int(b[0].item()) for b in buf], device=device, dtype=torch.long)
+        dnorm_t = torch.stack([b[1] for b in buf]).to(device)    # [B]
+        tsin_t  = torch.stack([b[2] for b in buf]).to(device)
+        tcos_t  = torch.stack([b[3] for b in buf]).to(device)
+        city_t  = torch.as_tensor([int(b[4].item()) for b in buf], device=device, dtype=torch.long)
+        poi_t   = torch.from_numpy(np.stack([b[5].cpu().numpy() for b in buf], axis=0)).to(device)
+        coords_t= torch.from_numpy(np.stack([b[6].cpu().numpy() for b in buf], axis=0)).to(device)  # [B, seq_len, 2]
+        target_t= torch.from_numpy(np.stack([b[7].cpu().numpy() for b in buf], axis=0)).to(device)  # [B, 2] norm
+        if target_t.ndim == 3 and target_t.shape[1] == 1:
+            target_t = target_t.squeeze(1)          # [B,2]
+
+
+        B = uid_t.shape[0]
+
+        # 2) Reconstrói (day_cur, slot_cur) e avança 1 passo → (day_next, slot_next)
+        day_cur  = torch.round(dnorm_t * 74).long()
+        angle    = torch.atan2(tsin_t, tcos_t)  # [-π, π]
+        slot_cur = torch.remainder(torch.round((angle + 2*torch.pi) / (2*torch.pi) * 48), 48).long()
+
+        slot_next = (slot_cur + 1) % 48
+        day_next  = day_cur + (slot_next == 0).long()
+
+        # 3) (Opcional) filtra por range de dias do PASSO n+1
+        if day_range is not None:
+            keep = (day_next >= day_range[0]) & (day_next <= day_range[1])
+        else:
+            keep = torch.ones(B, dtype=torch.bool, device=device)
+
+        if keep.sum().item() == 0:
+            return 0
+
+        # 4) Features temporais do n+1
+        t_sin_next  = sin_lut[slot_next]
+        t_cos_next  = cos_lut[slot_next]
+        d_norm_next = day_next.float() / 74.0
+
+        # 5) Forward 1-passo (n+1) no espaço NORMALIZADO
+        model.eval()
+        with torch.inference_mode():
+            pred_t = model.forward_single_step(
+                uid_t[keep], d_norm_next[keep], t_sin_next[keep], t_cos_next[keep],
+                city_t[keep], poi_t[keep], coords_t[keep]
+            )  # [b_keep, 2]
+            if pred_t.ndim == 3 and pred_t.shape[1] == 1:
+                pred_t = pred_t.squeeze(1)  
+
+        # 6) Normalizado → grade (0..199) e discretização oficial
+        def _denorm_xy(xy_norm_t: torch.Tensor, grid_size=200):
+            return torch.clamp(xy_norm_t * (grid_size - 1), 0, grid_size - 1)
+
+        pred_real = _denorm_xy(pred_t, grid_size)
+        gt_keep   = target_t[keep]
+        gt_real   = _denorm_xy(gt_keep, grid_size)
+
+        pred_cell = discretize_coordinates(pred_t).to(torch.int32)
+        gt_cell   = discretize_coordinates(gt_keep).to(torch.int32)
+
+        # 7) Monta tabela e escreve
+        def t2n(x): return x.detach().cpu().numpy()
+
+        rows_dict = {
+            "uid":           t2n(uid_t[keep]).astype(np.int64),
+            "city":          t2n(city_t[keep]).astype(np.int32),
+            "day":           t2n(day_next[keep]).astype(np.int32),
+            "slot":          t2n(slot_next[keep]).astype(np.int32),
+            "split":         np.array([split] * int(keep.sum().item())),
+            "seq_len":       np.array([seq_len_ckpt] * int(keep.sum().item()), dtype=np.int32),
+
+            "x_pred_norm": t2n(pred_t)[..., 0].astype(np.float32),
+            "y_pred_norm": t2n(pred_t)[..., 1].astype(np.float32),
+            "x_gt_norm":   t2n(gt_keep)[..., 0].astype(np.float32),
+            "y_gt_norm":   t2n(gt_keep)[..., 1].astype(np.float32),
+
+            "x_pred":      t2n(pred_real)[..., 0].astype(np.float32),
+            "y_pred":      t2n(pred_real)[..., 1].astype(np.float32),
+            "x_gt":        t2n(gt_real)[..., 0].astype(np.float32),
+            "y_gt":        t2n(gt_real)[..., 1].astype(np.float32),
+
+            "x_pred_cell": t2n(pred_cell)[..., 0].astype(np.int32),
+            "y_pred_cell": t2n(pred_cell)[..., 1].astype(np.int32),
+            "x_gt_cell":   t2n(gt_cell)[..., 0].astype(np.int32),
+            "y_gt_cell":   t2n(gt_cell)[..., 1].astype(np.int32),
+        }
+
+        table = pa.table(rows_dict, schema=schema)
+        writer.write_table(table)
+        return table.num_rows
+    print(f"📦 Pred+GT → Parquet | split={split} | cities={target_cities} | batch={batch_size}")
+
+    # ---------- 0) Schema do Parquet
+    schema = pa.schema([
+        ("uid", pa.int64()), ("city", pa.int32()),
+        ("day", pa.int32()), ("slot", pa.int32()),
+        ("split", pa.string()), ("seq_len", pa.int32()),
+        ("x_pred_norm", pa.float32()), ("y_pred_norm", pa.float32()),
+        ("x_gt_norm", pa.float32()),   ("y_gt_norm", pa.float32()),
+        ("x_pred", pa.float32()),      ("y_pred", pa.float32()),
+        ("x_gt", pa.float32()),        ("y_gt", pa.float32()),
+        ("x_pred_cell", pa.int32()),   ("y_pred_cell", pa.int32()),
+        ("x_gt_cell", pa.int32()),     ("y_gt_cell", pa.int32()),
+    ])
+    out_path = Path(output_file)
+    if out_path.suffix.lower() != ".parquet":
+        out_path = out_path.with_suffix(".parquet")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = pq.ParquetWriter(out_path.as_posix(), schema, compression="zstd", use_dictionary=True)
+
+    # ---------- 1) Carrega checkpoint/modelo (mesma lógica da submissão)
+    try:
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(checkpoint_path, map_location=device)
+
+    centers_obj = ckpt.get("centers", None) or ckpt.get("extra", {}).get("centers", None)
+    if centers_obj is None:
+        raise RuntimeError("Centers não encontrados no checkpoint.")
+    centers = centers_obj.to(device) if isinstance(centers_obj, torch.Tensor) \
+             else torch.as_tensor(centers_obj, dtype=torch.float32, device=device)
+
+    cfg   = ckpt.get("config", ckpt.get("extra", {}).get("config", {}))
+    state = ckpt.get("state_dict", ckpt.get("model_state_dict", ckpt))
+    seq_len_ckpt = int(cfg.get("sequence_length", sequence_length))
+
+    model = HuMobModel(
+        n_users=int(cfg.get("n_users", 100_000)),
+        n_cities=int(cfg.get("n_cities", 4)),
+        cluster_centers=centers,
+        sequence_length=seq_len_ckpt,
+        prediction_steps=int(cfg.get("prediction_steps", 1)),
+    ).to(device)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    # ---------- 2) Dataset com alvo (val/test)
+    ds = HuMobNormalizedDataset(
+        parquet_path=parquet_path,
+        cities=target_cities,
+        mode=split,                   # "val" ou "test"
+        sequence_length=seq_len_ckpt,
+        max_sequences_per_user=float('inf'),
+    )
+
+    # Lookups de seno/cosseno dos 48 slots
+    slots = torch.arange(48, device=device).float()
+    phase_lut = 2 * torch.pi * (slots / 48.0)
+    sin_lut, cos_lut = torch.sin(phase_lut), torch.cos(phase_lut)
+
+    # ---------- 3) Loop em batches
+    buf = []
+    total_rows = 0
+
+    with torch.inference_mode():
+        for sample in tqdm(ds, desc=f"pred-gt-{split}"):
+            buf.append(sample)
+
+            if len(buf) >= batch_size:
+                total_rows += _process_buffer(
+                    buf,
+                    model=model, device=device, writer=writer,
+                    sin_lut=sin_lut, cos_lut=cos_lut,
+                    seq_len_ckpt=seq_len_ckpt, split=split,
+                    grid_size=grid_size, day_range=day_range
+                )
+                buf.clear()
+
+    # restos (se sobrou < batch_size, processa igual)
+    if buf:
+        total_rows += _process_buffer(
+            buf,
+            model=model, device=device, writer=writer,
+            sin_lut=sin_lut, cos_lut=cos_lut,
+            seq_len_ckpt=seq_len_ckpt, split=split,
+            grid_size=grid_size, day_range=day_range
+        )
+        buf.clear()
+
+    writer.close()
+    print(f"✅ Pred+GT salvo: {out_path} • linhas={total_rows:,}")
+    return {"path": out_path.as_posix(), "rows": total_rows}
 
 
 
@@ -413,6 +691,7 @@ def main():
     )
     
     # Se o treinamento foi bem-sucedido, gera submissão
+    # Depois de gerar a submissão:
     if results:
         print("\n📄 Gerando submissão HuMob...")
         submission_df = generate_humob_submission(
@@ -422,13 +701,26 @@ def main():
             target_cities=["B", "C", "D"],
             submission_days=(61, 75),
             sequence_length=12,
-            output_file=f"humob_submission_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+            output_file=f"outputs/submissions/humob_submission_{datetime.now().strftime('%Y%m%d_%H%M')}.parquet"
         )
-        
-        print(f"\n🎉 PIPELINE COMPLETO!")
-        print(f"✅ Modelo treinado e salvo")
-        print(f"✅ Submissão gerada: {len(submission_df):,} predições")
-        print(f"✅ Pronto para envio ao HuMob Challenge!")
+
+        # 👇 NOVO: exporta Parquet com Pred+GT para análise posterior (MSE/cell error etc.)
+        print("\n📦 Exportando Pred+GT (1 passo) para análise...")
+        pairs_info = generate_pred_gt_parquet(
+            parquet_path=parquet_file,
+            checkpoint_path=results['checkpoint_path'],
+            device=device,
+            target_cities=["B", "C", "D"],
+            split="test",                     # ou "val"
+            day_range=(61, 75),               # manter apenas os últimos 15 dias
+            sequence_length=12,
+            output_file="outputs/eval/pred_gt_pairs_test.parquet",
+            batch_size=2048,
+            chunk_size=500_000,
+            grid_size=200,
+        )
+        print(f"✅ Pred+GT: {pairs_info['rows']:,} linhas em {pairs_info['path']}")
+
     
     return results
 

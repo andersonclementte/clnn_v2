@@ -145,16 +145,76 @@ class HuMobMLflowTracker:
 
     # ------------- logging utilitário -----------
 
-    def log_training_metrics(self, step: Optional[int] = None, **metrics: float) -> None:
-        """Log de métricas de treino/val. Use 'step=epoch' para gráficos por época."""
-        if step is not None:
-            mlflow.log_metrics(metrics, step=step)
+    # def log_training_metrics(self, step: Optional[int] = None, **metrics: float) -> None:
+    #     """Log de métricas de treino/val. Use 'step=epoch' para gráficos por época."""
+    #     if step is not None:
+    #         mlflow.log_metrics(metrics, step=step)
+    #     else:
+    #         mlflow.log_metrics(metrics)
+    def log_training_metrics(self, step: int | None = None, **metrics: float) -> None:
+        import numpy as np
+        numeric = {}
+        for k, v in metrics.items():
+            if isinstance(v, (int, float, np.number, bool)):
+                try: numeric[k] = float(v)
+                except Exception: pass
+        if not numeric:
+            return
+        if step is None:
+            mlflow.log_metrics(numeric)
         else:
-            mlflow.log_metrics(metrics)
+            mlflow.log_metrics(numeric, step=step)
 
-    def log_evaluation_results(self, **values: float) -> None:
-        """Log de métricas de avaliação finais."""
-        mlflow.log_metrics(values)
+
+    # def log_evaluation_results(self, **values: float) -> None:
+    #     """Log de métricas de avaliação finais."""
+    #     mlflow.log_metrics(values)
+    # mlflow_tracker.py
+
+    def log_evaluation_results(
+        self,
+        *,
+        city: str,
+        model_type: str,
+        step: int | None = None,
+        **values: float
+    ) -> None:
+        """
+        Loga resultados de avaliação.
+        - Converte apenas valores numéricos para métricas (float).
+        - city/model_type vão como tags.
+        - Prefixa métricas com a cidade para facilitar comparação.
+        """
+        import numpy as np
+
+        # 1) separa métricas numéricas
+        numeric: dict[str, float] = {}
+        for k, v in values.items():
+            # ignora None, strings, dicts, listas etc.
+            if v is None or isinstance(v, (str, dict, list, tuple)):
+                continue
+            # aceita int/float/np.number -> float
+            if isinstance(v, (int, float, np.number, bool)):  # bool vira 0/1
+                try:
+                    numeric[k] = float(v)
+                except Exception:
+                    pass
+
+        # 2) namespace por cidade (evita colisão de chaves)
+        namespaced = {f"eval_{city}_{k}": v for k, v in numeric.items()}
+
+        if namespaced:
+            if step is None:
+                mlflow.log_metrics(namespaced)
+            else:
+                mlflow.log_metrics(namespaced, step=step)
+
+        # 3) contexto como tags (strings OK aqui)
+        mlflow.set_tags({
+            "eval_city": str(city),
+            "eval_model_type": str(model_type),
+        })
+
 
     def log_artifact(self, path: str) -> None:
         mlflow.log_artifact(path)

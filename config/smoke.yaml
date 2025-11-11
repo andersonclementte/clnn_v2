@@ -30,12 +30,20 @@ hardware:
 
 eval:
   compare: true
-  n_samples: 200        # comparação rápida
+  pred_gt:
+    enabled: true                  # 👈 liga a geração do Parquet Pred+GT
+    split: "val"                   # use "val" (garante GT). "test" só se seu dataset expor GT
+    day_range: [61, 75]            # opcional; em "val" pode ser omitido
+    batch_size: 2048
+    target_cities: ["B","C","D"]
 
 submission:
-  enabled: True
+  enabled: False
+  days: [61, 75]
+  target_cities: ["B","C","D"]
 
 outputs:
   models_path: "outputs/models/"
   submissions_path: "outputs/submissions/"
   plots_path: "outputs/plots/"
+  eval_path: outputs/eval

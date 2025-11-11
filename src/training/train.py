@@ -223,18 +223,6 @@ def train_humob_model(
                 total += p.grad.detach().float().norm(2).item() ** 2
         return (total ** 0.5)
     
-    # Verifica se deve retomar
-    # start_epoch = 0
-    # if resume_from_checkpoint:
-    #     latest_checkpoint = get_latest_checkpoint()
-    #     if latest_checkpoint:
-    #         print(f"🔄 Retomando treinamento do checkpoint: {latest_checkpoint}")
-    #         start_epoch = load_checkpoint(model, optimizer, latest_checkpoint)
-    #         start_epoch += 1  # Começa da próxima época
-    #         print(f"🚀 Continuando da época {start_epoch}/{n_epochs}")
-    #     else:
-    #         print("📝 Nenhum checkpoint encontrado, iniciando do zero")
-    
     best_val_loss = float('inf')
     train_losses = []
     val_losses = []
@@ -365,45 +353,6 @@ def train_humob_model(
         print(f"Treino: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f}")
         print(f"Fusion weights: w_r={w_r:.3f}, w_e={w_e:.3f}")
         
-        
-        # # Salva a cada N épocas
-        # if (epoch + 1) % checkpoint_every_n_epochs == 0:
-        #     save_checkpoint(
-        #         model=model,
-        #         optimizer=optimizer,
-        #         epoch=epoch,
-        #         val_loss=avg_val_loss,
-        #         save_dir="outputs/models/checkpoints/",
-        #         filename=f"checkpoint_epoch_{epoch+1}.pt",
-        #         extra_data={
-        #             'centers': cluster_centers.cpu().numpy(),
-        #             'config': {
-        #                 'n_users': n_users,
-        #                 'n_cities': 4,
-        #                 'sequence_length': sequence_length,
-        #                 'prediction_steps': 1,
-        #                 'n_clusters': cluster_centers.shape[0]
-        #             },
-        #             'train_loss': avg_train_loss,
-        #             'mlflow_run_id': run_id  # Agora sempre definido
-        #         }
-        #     )
-            
-        # # MLflow logging
-        # if mlflow_tracker is not None:
-        #     mlflow_tracker.log_training_metrics(
-        #         epoch=epoch,
-        #         train_loss=avg_train_loss,
-        #         val_loss=avg_val_loss,
-        #         fusion_w_r=w_r,       # <- NÃO passe dict
-        #         fusion_w_e=w_e,
-        #         grad_norm=post_clip_norm,
-        #         learning_rate=optimizer.param_groups[0]["lr"]
-        #     )
-
-        #     # Remove checkpoints antigos
-        #     _cleanup_old_checkpoints(keep_last_n_checkpoints)
-
         # centers como tensor (sem numpy)
         centers_tensor = cluster_centers.detach().cpu()
 

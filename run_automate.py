@@ -10,7 +10,7 @@ import torch
 # --- imports do seu projeto ---
 from src.training.train import compute_cluster_centers, train_humob_model
 from src.training.finetune import sequential_finetuning, compare_models_performance
-from src.training.pipeline import generate_humob_submission
+from src.training.pipeline import generate_humob_submission, generate_pred_gt_parquet
 
 # MLflow helper: suporta tanto helpers em nível de módulo quanto a classe
 try:
@@ -52,6 +52,9 @@ def run_from_yaml(cfg_path: str) -> None:
     os.makedirs(models_dir, exist_ok=True)
     os.makedirs(submissions_dir, exist_ok=True)
     os.makedirs(plots_dir, exist_ok=True)
+
+    eval_dir = Path(_get(cfg, "outputs.eval_path", "outputs/eval")).as_posix()
+    os.makedirs(eval_dir, exist_ok=True)
 
     # ---- device/hardware ----
     prefer_device = _get(cfg, "hardware.device", "cuda")
@@ -160,9 +163,20 @@ def run_from_yaml(cfg_path: str) -> None:
     # ===========================================================
     do_compare = bool(_get(cfg, "eval.compare", True))
     do_submit  = bool(_get(cfg, "submission.enabled", False))
+    do_predgt = bool(_get(cfg, "eval.pred_gt.enabled", False))
+    predgt_split = _get(cfg, "eval.pred_gt.split", "val")   # "val" é mais seguro (tem GT)
+    predgt_day_range = tuple(_get(cfg, "eval.pred_gt.day_range", (61, 75)))
+    predgt_bs = int(_get(cfg, "eval.pred_gt.batch_size", 2048))
+    predgt_cities = _get(cfg, "eval.pred_gt.target_cities", ft_cities)
     compare_samples = int(_get(cfg, "eval.n_samples", 1000))
     submission_days = tuple(_get(cfg, "submission.days", (61, 75)))
     target_submit_cities = _get(cfg, "submission.target_cities", ft_cities)
+
+    final_ckpt = next(
+        (res["checkpoint"] for _, res in reversed(list(results.items()))
+        if res.get("status") == "success"),
+        base_ckpt.as_posix(),
+    )
 
     if do_compare:
         print("\n📊 ETAPA 4/4 — Comparação de modelos")
@@ -187,13 +201,13 @@ def run_from_yaml(cfg_path: str) -> None:
         print("\n📄 Gerando submissão final")
 
         # pega o último FT bem-sucedido; senão usa o base
-        final_ckpt = next(
-            (res["checkpoint"] for _, res in reversed(list(results.items()))
-            if res.get("status") == "success"),
-            base_ckpt.as_posix(),
-        )
+        # final_ckpt = next(
+        #     (res["checkpoint"] for _, res in reversed(list(results.items()))
+        #     if res.get("status") == "success"),
+        #     base_ckpt.as_posix(),
+        # )
 
-        sub_path = Path(submissions_dir) / "humob_submission.csv"
+        sub_path = Path(submissions_dir) / "humob_submission_parquet"
         out = generate_humob_submission(
             parquet_path=parquet_path,
             checkpoint_path=final_ckpt,
@@ -203,12 +217,32 @@ def run_from_yaml(cfg_path: str) -> None:
             sequence_length=seq_len,
             output_file=sub_path.as_posix(),
             # opcionais (se quiser controlar pelo YAML):
-            # chunk_size=50_000,
-            # users_batch=512,
+            chunk_size=500_000,
+            users_batch=512,
         )
         print(f"   ✅ Submissão gerada: {sub_path.name} ({out['rows']:,} linhas, {out['users']:,} usuários)")
     else:
         print("📄 Submissão desativada pelo YAML")
+
+    if do_predgt:
+        print("\n📦 Exportando Pred+GT (1 passo) para análise...")
+        predgt_out = Path(eval_dir) / f"pred_gt_pairs_{predgt_split}.parquet"
+        info = generate_pred_gt_parquet(
+            parquet_path=parquet_path,
+            checkpoint_path=final_ckpt,
+            device=device,
+            target_cities=predgt_cities,
+            split=predgt_split,             # "val" (seguro) ou "test" (se tiver GT)
+            day_range=predgt_day_range,     # p.ex. (61, 75)
+            sequence_length=seq_len,
+            output_file=predgt_out.as_posix(),
+            batch_size=predgt_bs,
+            grid_size=200,
+        )
+        print(f"   ✅ Pred+GT: {info['rows']:,} linhas -> {info['path']}")
+    else:
+        print("📦 Pred+GT desativado pelo YAML")
+
 
     print("\n🎉 FIM — pipeline concluído.")
 
