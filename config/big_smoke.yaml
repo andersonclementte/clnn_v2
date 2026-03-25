@@ -8,20 +8,20 @@ data:
   finetune_cities: ["B","C","D"]
 
 model:
-  n_clusters: 16        # poucos clusters para acelerar o KMeans
+  n_clusters: 512        # poucos clusters para acelerar o KMeans
   n_users: 100000          # amostra pequena de usuários
-  sequence_length: 12   # janelas curtas
+  sequence_length: 720   # janelas curtas
 
 training:
   base:
-    n_epochs: 1
+    n_epochs: 8
     learning_rate: 3e-4
-    batch_size: 16
+    batch_size: 64
     mixed_precision: true
   finetune:
-    n_epochs: 1
+    n_epochs: 5
     learning_rate: 5e-5
-    batch_size: 8
+    batch_size: 16
 
 hardware:
   device: "cuda"        # cai para "cpu" se não tiver GPU

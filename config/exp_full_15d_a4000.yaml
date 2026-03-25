@@ -2,48 +2,46 @@ experiment_name: humob2
 logging:
   tracking_uri: "file:./mlruns"
 
+
 data:
   parquet_file: "humob_all_cities_v2_normalized.parquet"
-  base_city: "A"
-  finetune_cities: ["B","C","D"]
+  processed_data_path: "data/processed/"
 
 model:
-  n_clusters: 16        # poucos clusters para acelerar o KMeans
-  n_users: 100000          # amostra pequena de usuários
-  sequence_length: 12   # janelas curtas
+  n_clusters: 512
+  n_users: 100000
+  sequence_length: 720
 
 training:
   base:
-    n_epochs: 1
+    n_epochs: 8
     learning_rate: 3e-4
-    batch_size: 16
+    batch_size: 64          # seguro p/ A4000 em seq_len=720
     mixed_precision: true
   finetune:
-    n_epochs: 1
+    n_epochs: 5
     learning_rate: 5e-5
-    batch_size: 8
+    batch_size: 16          # FT costuma precisar um pouco menos
 
 hardware:
-  device: "cuda"        # cai para "cpu" se não tiver GPU
+  device: "cuda"
   pin_memory: true
-  num_workers: 0        # IterableDataset: evita duplicar leitura
+  num_workers: 4
 
 eval:
   compare: true
   pred_gt:
     enabled: true                  # 👈 liga a geração do Parquet Pred+GT
-    split: "test"                   # use "val" (garante GT). "test" só se seu dataset expor GT
+    split: "val"                   # use "val" (garante GT). "test" só se seu dataset expor GT
     day_range: [61, 75]            # opcional; em "val" pode ser omitido
     batch_size: 2048
     target_cities: ["B","C","D"]
 
-submission:
-  enabled: False
-  days: [61, 75]
-  target_cities: ["B","C","D"]
+do_submit: false
+target_submit_cities: ["B", "C", "D"]
+submission_days: [61, 75]
 
 outputs:
   models_path: "outputs/models/"
   submissions_path: "outputs/submissions/"
   plots_path: "outputs/plots/"
-  eval_path: outputs/eval

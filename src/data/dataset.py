@@ -27,9 +27,9 @@ class HuMobNormalizedDataset(IterableDataset):
         prediction_steps: int = 1,
         chunk_size: int = 10_000,
         max_sequences_per_user: int = 50,
-        train_days: tuple = (0.0, 0.8),      # Normalizado [0,1]
-        val_days: tuple = (0.8, 1.0),
-        test_days: tuple = (0.8, 1.0)       # Para cidades B,C,D
+        train_days: tuple = (0.0, 0.80),     # Normalizado [0,1]
+        val_days: tuple = (0.78, 1.0),       # Overlap intencional para seq_len longo
+        test_days: tuple = (0.78, 1.0)       # Para cidades B,C,D
     ):
         self.parquet_path = parquet_path
         self.cities = cities
@@ -153,7 +153,11 @@ class HuMobNormalizedDataset(IterableDataset):
 
     def __iter__(self):
         pf = pq.ParquetFile(self.parquet_path)
-        
+
+        # ── Fase 1: acumular dados filtrados por usuário ──────────────
+        user_buffers = {}          # uid → list[DataFrame]
+        total_rows_read = 0
+
         for batch in pf.iter_batches(batch_size=self.chunk_size):
             table = pa.Table.from_batches([batch], schema=pf.schema_arrow)
 
@@ -161,13 +165,12 @@ class HuMobNormalizedDataset(IterableDataset):
             if 'city' in table.column_names:
                 city_mask = pc.is_in(table.column('city'), pa.array(list(self.cities_set)))
             elif 'city_encoded' in table.column_names:
-                # Se já tem city_encoded, filtra por valores numéricos
                 city_map = {"A": 0, "B": 1, "C": 2, "D": 3}
                 target_cities = [city_map[c] for c in self.cities if c in city_map]
                 city_mask = pc.is_in(table.column('city_encoded'), pa.array(target_cities))
             else:
                 continue
-                
+
             table = table.filter(city_mask)
             if table.num_rows == 0:
                 continue
@@ -182,35 +185,45 @@ class HuMobNormalizedDataset(IterableDataset):
                 if table.num_rows == 0:
                     continue
 
-            # Converte para pandas
             df = table.to_pandas()
-            
+
             # Verifica sanidade dos dados
             if not self.check_data_sanity(df):
                 print("⚠️ Pulando batch com problemas nos dados")
                 continue
-            
-            # Processa cada usuário
-            for uid, user_group in df.groupby('uid'):
-                if len(user_group) < self.sequence_length + self.prediction_steps:
-                    continue
-                
-                sequences = self._sample_user_sequences(
-                    user_group, 
-                    self.max_sequences_per_user
+
+            total_rows_read += len(df)
+
+            # Acumula por uid (não gera sequências ainda)
+            for uid, grp in df.groupby('uid'):
+                user_buffers.setdefault(uid, []).append(grp)
+
+        print(f"📊 [{self.mode}] {len(user_buffers)} usuários, {total_rows_read:,} linhas "
+              f"(cidades={self.cities}, d_norm={self.day_range})")
+
+        # ── Fase 2: gerar sequências com dados completos de cada uid ──
+        for uid, dfs in user_buffers.items():
+            user_df = pd.concat(dfs).sort_values(['d_norm', 't_sin', 't_cos'])
+
+            if len(user_df) < self.sequence_length + self.prediction_steps:
+                continue
+
+            sequences = self._sample_user_sequences(
+                user_df,
+                self.max_sequences_per_user
+            )
+
+            for seq in sequences:
+                yield (
+                    torch.tensor(seq['uid'], dtype=torch.long),
+                    torch.tensor(seq['d_norm'], dtype=torch.float32),
+                    torch.tensor(seq['t_sin'], dtype=torch.float32),
+                    torch.tensor(seq['t_cos'], dtype=torch.float32),
+                    torch.tensor(seq['city_encoded'], dtype=torch.long),
+                    torch.from_numpy(seq['poi_norm']),
+                    torch.from_numpy(seq['coords_seq']),
+                    torch.from_numpy(seq['target_coords'])
                 )
-                
-                for seq in sequences:
-                    yield (
-                        torch.tensor(seq['uid'], dtype=torch.long),
-                        torch.tensor(seq['d_norm'], dtype=torch.float32),
-                        torch.tensor(seq['t_sin'], dtype=torch.float32),
-                        torch.tensor(seq['t_cos'], dtype=torch.float32),
-                        torch.tensor(seq['city_encoded'], dtype=torch.long),
-                        torch.from_numpy(seq['poi_norm']),
-                        torch.from_numpy(seq['coords_seq']),
-                        torch.from_numpy(seq['target_coords'])
-                    )
 
 
 def create_humob_loaders(
