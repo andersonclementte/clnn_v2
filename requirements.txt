@@ -8,4 +8,5 @@ tqdm
 rich
 scikit-learn
 pyarrow
-seaborn
+seaborngit+https://github.com/yahoojapan/geobleu.git
+fastdtw
