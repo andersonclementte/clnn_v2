@@ -1,17 +1,15 @@
-"""
-Avalia os modelos treinados com as métricas oficiais do HuMob Challenge.
-Usa pred_gt_all_users.parquet — não requer re-treino.
+import subprocess, sys, os
 
-Instala geobleu e fastdtw automaticamente se não estiverem disponíveis.
-"""
-import subprocess, sys
+_pip_target = "/tmp/pip_libs"
+os.makedirs(_pip_target, exist_ok=True)
 subprocess.run(
-    [sys.executable, "-m", "pip", "install", "--quiet",
+    [sys.executable, "-m", "pip", "install", "--quiet", "--target", _pip_target,
      "git+https://github.com/yahoojapan/geobleu.git", "fastdtw"],
     check=True,
 )
+if _pip_target not in sys.path:
+    sys.path.insert(0, _pip_target)
 
-import os
 os.chdir("/workspace")
 
 import mlflow
