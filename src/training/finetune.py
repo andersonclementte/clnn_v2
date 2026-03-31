@@ -125,7 +125,7 @@ def finetune_model(
         mode="train",
         sequence_length=sequence_length,
         train_days=data_split,
-        val_days=(0.8, 1.0),
+        val_days=(0.5, 1.0),
         max_sequences_per_user=30
     )
     
@@ -135,7 +135,7 @@ def finetune_model(
         mode="val",
         sequence_length=sequence_length,
         train_days=data_split,
-        val_days=(0.8, 1.0),
+        val_days=(0.5, 1.0),
         max_sequences_per_user=10
     )
     
@@ -526,10 +526,16 @@ def compare_models_performance(
         print(f"\n🔍 Avaliando {model_name}...")
         
         # Determina tipo do modelo baseado no nome
-        model_type = "fine_tuned" if "fine" in model_name.lower() else "zero_shot"
+        model_type = "fine_tuned" if any(k in model_name.upper() for k in ["FT", "FINE"]) else "zero_shot"
                 
         results[model_name] = {}
-        
+
+        import mlflow as _mlflow
+        _run_name = f"eval_{model_name.replace(' ', '_')}"
+        _run_ctx = _mlflow.start_run(run_name=_run_name, nested=True) if mlflow_tracker is not None else None
+        if _run_ctx is not None:
+            _mlflow.set_tags({"stage": "evaluation", "model_name": model_name, "model_type": model_type})
+
         for city in test_cities:
             try:
                 mse, cell_error = evaluate_model(
@@ -538,16 +544,20 @@ def compare_models_performance(
                     device=device,
                     cities=[city],
                     n_samples=n_samples,
-                    # MLflow - Passa tracker
                     mlflow_tracker=mlflow_tracker,
                     model_type=model_type
                 )
                 results[model_name][city] = {'mse': mse, 'cell_error': cell_error}
+                if _run_ctx is not None:
+                    _mlflow.log_metrics({f"mse_{city}": mse, f"cell_error_{city}": cell_error})
                 print(f"   {city}: MSE={mse:.4f}, Erro células={cell_error:.2f}")
-                
+
             except Exception as e:
                 print(f"   ❌ {city}: Erro - {e}")
                 results[model_name][city] = {'mse': float('inf'), 'cell_error': float('inf')}
+
+        if _run_ctx is not None:
+            _mlflow.end_run()
     
     # MLflow - Log comparação completa
     if mlflow_tracker is not None:

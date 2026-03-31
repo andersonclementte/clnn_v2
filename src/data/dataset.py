@@ -153,14 +153,19 @@ class HuMobNormalizedDataset(IterableDataset):
 
     def __iter__(self):
         pf = pq.ParquetFile(self.parquet_path)
+        min_length = self.sequence_length + self.prediction_steps
 
-        # ── Fase 1: acumular dados filtrados por usuário ──────────────
-        user_buffers = {}          # uid → list[DataFrame]
+        # ── Buffer de spillover: uid → list[DataFrame] ────────────────
+        # Guarda apenas usuários cujos dados ainda podem continuar
+        # no próximo chunk. Usuários que desaparecem do stream são
+        # finalizados imediatamente, liberando memória.
+        spillover: dict = {}
+        prev_uids: set = set()      # uids vistos no chunk anterior
         total_rows_read = 0
+        total_seqs = 0
 
-        for batch in pf.iter_batches(batch_size=self.chunk_size):
-            table = pa.Table.from_batches([batch], schema=pf.schema_arrow)
-
+        def _filter_chunk(table):
+            """Aplica filtros de cidade e d_norm. Retorna DataFrame ou None."""
             # Filtra cidades
             if 'city' in table.column_names:
                 city_mask = pc.is_in(table.column('city'), pa.array(list(self.cities_set)))
@@ -169,13 +174,11 @@ class HuMobNormalizedDataset(IterableDataset):
                 target_cities = [city_map[c] for c in self.cities if c in city_map]
                 city_mask = pc.is_in(table.column('city_encoded'), pa.array(target_cities))
             else:
-                continue
-
+                return None
             table = table.filter(city_mask)
             if table.num_rows == 0:
-                continue
-
-            # Filtra por range de dias (normalizado)
+                return None
+            # Filtra por range de dias
             if 'd_norm' in table.column_names:
                 day_mask = pc.and_(
                     pc.greater_equal(table.column("d_norm"), self.day_range[0]),
@@ -183,37 +186,21 @@ class HuMobNormalizedDataset(IterableDataset):
                 )
                 table = table.filter(day_mask)
                 if table.num_rows == 0:
-                    continue
-
+                    return None
             df = table.to_pandas()
-
-            # Verifica sanidade dos dados
             if not self.check_data_sanity(df):
-                print("⚠️ Pulando batch com problemas nos dados")
-                continue
+                return None
+            return df
 
-            total_rows_read += len(df)
-
-            # Acumula por uid (não gera sequências ainda)
-            for uid, grp in df.groupby('uid'):
-                user_buffers.setdefault(uid, []).append(grp)
-
-        print(f"📊 [{self.mode}] {len(user_buffers)} usuários, {total_rows_read:,} linhas "
-              f"(cidades={self.cities}, d_norm={self.day_range})")
-
-        # ── Fase 2: gerar sequências com dados completos de cada uid ──
-        for uid, dfs in user_buffers.items():
+        def _yield_user(uid):
+            """Gera sequências para uid e remove do spillover."""
+            dfs = spillover.pop(uid, None)
+            if dfs is None:
+                return
             user_df = pd.concat(dfs).sort_values(['d_norm', 't_sin', 't_cos'])
-
-            if len(user_df) < self.sequence_length + self.prediction_steps:
-                continue
-
-            sequences = self._sample_user_sequences(
-                user_df,
-                self.max_sequences_per_user
-            )
-
-            for seq in sequences:
+            if len(user_df) < min_length:
+                return
+            for seq in self._sample_user_sequences(user_df, self.max_sequences_per_user):
                 yield (
                     torch.tensor(seq['uid'], dtype=torch.long),
                     torch.tensor(seq['d_norm'], dtype=torch.float32),
@@ -224,6 +211,36 @@ class HuMobNormalizedDataset(IterableDataset):
                     torch.from_numpy(seq['coords_seq']),
                     torch.from_numpy(seq['target_coords'])
                 )
+
+        for batch in pf.iter_batches(batch_size=self.chunk_size):
+            table = pa.Table.from_batches([batch], schema=pf.schema_arrow)
+            df = _filter_chunk(table)
+            if df is None:
+                # Chunk sem dados relevantes: apenas pula, mantém spillover
+                continue
+
+            total_rows_read += len(df)
+            cur_uids = set(df['uid'].unique())
+
+            # Usuários que estavam no chunk anterior mas sumiram agora
+            # → dados completos → gera sequências e libera memória
+            for uid in prev_uids - cur_uids:
+                yield from _yield_user(uid)
+
+            # Acumula dados do chunk atual no spillover
+            for uid, grp in df.groupby('uid'):
+                spillover.setdefault(uid, []).append(grp)
+
+            prev_uids = cur_uids
+
+        # ── Flush final: usuários restantes no spillover ──────────────
+        n_users = len(spillover)
+        print(f"📊 [{self.mode}] ~{n_users} usuários finalizados | "
+              f"{total_rows_read:,} linhas "
+              f"(cidades={self.cities}, d_norm={self.day_range})")
+
+        for uid in list(spillover.keys()):
+            yield from _yield_user(uid)
 
 
 def create_humob_loaders(
