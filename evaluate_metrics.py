@@ -21,7 +21,7 @@ CITY_MAP = {1: "B", 2: "C", 3: "D"}
 
 print("Carregando predições...")
 df = pd.read_parquet(PARQUET)
-print(f"  {len(df):,} linhas, {df[uid].nunique():,} usuários únicos\n")
+print(f"  {len(df):,} linhas, {df['uid'].nunique():,} usuários únicos\n")
 
 results = {}
 for city_code, city_name in CITY_MAP.items():
