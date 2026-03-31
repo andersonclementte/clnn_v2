@@ -21,7 +21,7 @@ CITY_MAP = {1: "B", 2: "C", 3: "D"}
 
 print("Carregando predições...")
 df = pd.read_parquet(PARQUET)
-print(f"  {len(df):,} linhas, {df['uid'].nunique():,} usuários únicos\n")
+print(f"  {len(df):,} linhas, {df[uid].nunique():,} usuários únicos\n")
 
 results = {}
 for city_code, city_name in CITY_MAP.items():
@@ -29,23 +29,23 @@ for city_code, city_name in CITY_MAP.items():
     n_users = city_df["uid"].nunique()
     print(f"Cidade {city_name} — {n_users} usuários, {len(city_df):,} pontos")
 
-    print(f"  Calculando GEO-BLEU...")
+    print("  Calculando GEO-BLEU...")
     geo_bleu = compute_geobleu(city_df)
 
-    print(f"  Calculando DTW...")
+    print("  Calculando DTW...")
     dtw = compute_dtw(city_df)
 
     results[city_name] = {"geo_bleu": geo_bleu, "dtw": dtw, "n_users": n_users}
-    print(f"  ✓ GEO-BLEU={geo_bleu:.4f}  DTW={dtw:.2f}\n")
+    print(f"  GEO-BLEU={geo_bleu:.4f}  DTW={dtw:.2f}\n")
 
 # Resumo final
 print("=" * 50)
-print(f"{Cidade:<8} {GEO-BLEU:>10} {DTW:>10} {Usuários:>10}")
+print(f"{Cidade:<8} {GEO-BLEU:>10} {DTW:>10} {Usuarios:>10}")
 print("-" * 50)
 for city_name, m in results.items():
     print(f"{city_name:<8} {m[geo_bleu]:>10.4f} {m[dtw]:>10.2f} {m[n_users]:>10}")
 print("=" * 50)
-print("Referência top HuMob 2024: GEO-BLEU=0.319 | DTW=27.15")
+print("Referencia top HuMob 2024: GEO-BLEU=0.319 | DTW=27.15")
 
 # Log to MLflow
 mlflow.set_experiment("humob2")
