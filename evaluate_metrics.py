@@ -21,7 +21,7 @@ CITY_MAP = {1: "B", 2: "C", 3: "D"}
 
 print("Carregando predições...")
 df = pd.read_parquet(PARQUET)
-print(f"  {len(df):,} linhas, {df[uid].nunique():,} usuários únicos\n")
+print(f"  {len(df):,} linhas, {df['uid'].nunique():,} usuários únicos\n")
 
 results = {}
 for city_code, city_name in CITY_MAP.items():
@@ -43,7 +43,7 @@ print("=" * 50)
 print(f"{Cidade:<8} {GEO-BLEU:>10} {DTW:>10} {Usuarios:>10}")
 print("-" * 50)
 for city_name, m in results.items():
-    print(f"{city_name:<8} {m[geo_bleu]:>10.4f} {m[dtw]:>10.2f} {m[n_users]:>10}")
+    print(f"{city_name:<8} {m['geo_bleu']:>10.4f} {m['dtw']:>10.2f} {m['n_users']:>10}")
 print("=" * 50)
 print("Referencia top HuMob 2024: GEO-BLEU=0.319 | DTW=27.15")
 
