@@ -38,14 +38,12 @@
 
 ### 1.4 Métricas Oficiais do Challenge
 
-⚠️ **O modelo atual NÃO usa as métricas oficiais.** Isso precisa ser corrigido antes do artigo.
+✅ **GEO-BLEU e DTW já implementados** (`src/utils/metrics.py`, `evaluate_metrics.py`).
 
-| Métrica | Descrição | Melhor valor | Top 2024 |
-|---------|-----------|-------------|----------|
-| **GEO-BLEU** | Similaridade geográfica de trajetórias (dia a dia) | Maior = melhor | 0.319 (Team 22) |
-| **DTW** | Dynamic Time Warping — similaridade temporal de trajetórias | Menor = melhor | 27.15 (Team 24) |
-
-O modelo atual usa MSE e cell_error (erro médio em células), que são métricas de desenvolvimento mas **não comparáveis com outros trabalhos do challenge**.
+| Métrica | Descrição | Melhor valor | Top 2024 | Nosso resultado (médio) |
+|---------|-----------|-------------|----------|------------------------|
+| **GEO-BLEU** | Similaridade geográfica de trajetórias (dia a dia) | Maior = melhor | 0.319 (Team 22) | ~0.079 (B+C+D) |
+| **DTW** | Dynamic Time Warping — similaridade temporal de trajetórias | Menor = melhor | 27.15 (Team 24) | ~189 (B+C+D) |
 
 Implementação de referência: https://github.com/yahoojapan/geobleu
 
@@ -115,7 +113,7 @@ POI Projection        ─┘
 | C | 5 (early stop na 5ª) | 0.00234 |
 | D | 3 (verificar logs) | 0.00231 |
 
-### 3.3 Avaliação Final (Zero-shot vs Fine-tuned)
+### 3.3 Avaliação Final — cell_error (Zero-shot vs Fine-tuned)
 
 Avaliado com `n_samples=1000` usando `evaluate_model`:
 
@@ -125,7 +123,7 @@ Avaliado com `n_samples=1000` usando `evaluate_model`:
 | C | 11.36 células | 10.04 células | -11.6% | 5.68 km | 5.02 km |
 | D | 4.86 células | 4.57 células | -6.0% | 2.43 km | 2.28 km |
 
-### 3.4 Avaliação sobre Todos os Usuários (pred_gt_all_users.parquet)
+### 3.4 Cobertura de Usuários (pred_gt_all_users.parquet)
 
 Avaliado sobre todos os usuários com dados suficientes (`test_days=(0.55, 1.0)`, `max_seqs=30`):
 
@@ -135,9 +133,23 @@ Avaliado sobre todos os usuários com dados suficientes (`test_days=(0.55, 1.0)`
 | C | 1.406 | ~20.000 | 7.1% | **4.30 km** | 5.48 km | 11.01 km |
 | D | 1.970 | ~6.000 | 32.9% | **2.06 km** | 3.87 km | 9.55 km |
 
-**Por que só 5–33% dos usuários?** Com `seq_len=720` (15 dias de contexto), o usuário precisa ter 720 registros consecutivos na cidade. Como os usuários **transitam entre cidades**, a maioria só aparece esporadicamente em B, C, D — a mediana de registros por usuário no período de teste é ~400 (menos que 720).
+**Por que só 5–33% dos usuários?** Com `seq_len=720` (15 dias de contexto), o usuário precisa ter 720 registros consecutivos na cidade. Como os usuários transitam entre cidades, a maioria só aparece esporadicamente em B, C, D.
 
-**Nota sobre cidade C:** erro significativamente maior em todas as métricas. Hipóteses: área geográfica maior, padrões de mobilidade mais heterogêneos, ou menos dados de treino.
+### 3.5 Métricas Oficiais — GEO-BLEU e DTW (rodado em 2026-03-31)
+
+Avaliado sobre `pred_gt_all_users.parquet` (130.007 predições, 5.033 usuários):
+
+| Cidade | Usuários | GEO-BLEU | DTW | GEO-BLEU top 2024 | DTW top 2024 |
+|--------|----------|----------|-----|-------------------|--------------|
+| B | 2.334 | **0.1017** | **174.70** | 0.319 | 27.15 |
+| C | 1.406 | **0.0276** | **236.92** | 0.319 | 27.15 |
+| D | 1.970 | **0.1076** | **156.91** | 0.319 | 27.15 |
+
+**Interpretação:**
+- B e D atingem GEO-BLEU ~0.10, que é um baseline razoável considerando que o modelo não foi otimizado para essa métrica
+- C apresenta GEO-BLEU 0.027, consistente com o cell_error 2× maior observado anteriormente
+- DTW alto (~175–237 vs 27 do top) indica desvios temporais significativos nas trajetórias previstas
+- A diferença para o top é esperada: os líderes do HuMob 2024 usaram Transformers com arquiteturas muito maiores
 
 ---
 
@@ -150,14 +162,13 @@ Avaliado sobre todos os usuários com dados suficientes (`test_days=(0.55, 1.0)`
 - **Arquivo:** `src/training/finetune.py`, linhas 128 e 138
 
 ### Bug 2 — Flush prematuro do spillover (`dataset.py`)
-- **Problema:** Quando um chunk do parquet não tinha dados relevantes (cidade/período filtrados), o código fazia flush de TODOS os usuários acumulados, mesmo que tivessem dados chegando em chunks futuros
+- **Problema:** Quando um chunk do parquet não tinha dados relevantes, o código fazia flush de TODOS os usuários acumulados, mesmo que tivessem dados chegando em chunks futuros
 - **Sintoma:** Usuários com dados esparsos geravam sequências incompletas
 - **Correção:** Remover o flush e reset de `prev_uids` quando `df is None`; apenas `continue`
 - **Arquivo:** `src/data/dataset.py`, função `__iter__`
 
 ### Bug 3 — MLflow sobrescrevia métricas na comparação (`finetune.py`)
-- **Problema:** `compare_models_performance` logava todos os modelos no mesmo run MLflow → métricas de modelos diferentes se sobrescreviam. Além disso, `model_type` era sempre `"zero_shot"` porque a detecção usava `"fine" in model_name.lower()` mas os nomes eram `"FT B"` (sem "fine")
-- **Sintoma:** Apenas um run de comparação com tag `zero_shot`, métricas finais eram do último modelo avaliado
+- **Problema:** `compare_models_performance` logava todos os modelos no mesmo run MLflow. Além disso, `model_type` era sempre `"zero_shot"` porque a detecção usava `"fine" in model_name.lower()` mas os nomes eram `"FT B"`
 - **Correção:** Criar run MLflow separado por modelo; corrigir detecção para `any(k in model_name.upper() for k in ["FT", "FINE"])`
 - **Arquivo:** `src/training/finetune.py`, função `compare_models_performance`
 
@@ -165,19 +176,16 @@ Avaliado sobre todos os usuários com dados suficientes (`test_days=(0.55, 1.0)`
 
 ## 5. Limitações Conhecidas
 
-### 5.1 Métricas Incorretas para o Challenge
-O modelo usa MSE e cell_error. As métricas oficiais são **GEO-BLEU** e **DTW**. Sem implementá-las, os resultados não são comparáveis com a literatura do challenge.
-
-### 5.2 Cobertura de Usuários
+### 5.1 Cobertura de Usuários
 Com `seq_len=720`, apenas 7–33% dos usuários têm dados suficientes para avaliação. Isso é uma limitação intrínseca do dataset (usuários transitam entre cidades) e do `seq_len` longo.
 
-### 5.3 Modelo Possivelmente Subparametrizado
+### 5.2 Modelo Possivelmente Subparametrizado
 ~662K parâmetros para 100K usuários com sequências de 720 pontos pode ser insuficiente. Os top performers do HuMob 2024 usaram Transformers, BERT, e modelos maiores.
 
-### 5.4 Transição entre Cidades não Modelada
-O modelo trata cada cidade de forma independente. Na realidade, os usuários transitam entre cidades — uma previsão mais realista deveria considerar a trajetória global do indivíduo, não apenas dentro de uma cidade.
+### 5.3 Transição entre Cidades não Modelada
+O modelo trata cada cidade de forma independente. Na realidade, os usuários transitam entre cidades — uma previsão mais realista deveria considerar a trajetória global do indivíduo.
 
-### 5.5 Conversão km não Verificada Empiricamente
+### 5.4 Conversão km não Verificada Empiricamente
 O fator de conversão `1 célula = 0.5 km` foi inferido do código (`ft_avg * 0.5`). Não foi verificado contra a documentação oficial do dataset YJMob.
 
 ---
@@ -198,7 +206,7 @@ O fator de conversão `1 célula = 0.5 km` foi inferido do código (`ft_avg * 0.
 | Arquivo | Descrição |
 |---------|-----------|
 | `outputs/eval/pred_gt_all_users.parquet` | 130.007 predições, 5.033 usuários, dias 61–75 |
-| `mlruns/` | Todos os runs MLflow (treino, finetuning, comparação) |
+| `mlruns/` | Todos os runs MLflow (treino, finetuning, comparação, métricas oficiais) |
 
 ### 6.3 Scripts Importantes
 
@@ -207,6 +215,7 @@ O fator de conversão `1 célula = 0.5 km` foi inferido do código (`ft_avg * 0.
 | `run_automate.py` | Pipeline principal (YAML → KMeans → treino → FT → avaliação) |
 | `eval_comparison.py` | Re-avaliação zero-shot vs FT com MLflow correto |
 | `generate_full_eval.py` | Gera pred_gt para todos os usuários disponíveis |
+| `evaluate_metrics.py` | ★ Calcula GEO-BLEU e DTW oficiais a partir do parquet existente |
 
 ---
 
@@ -220,7 +229,7 @@ O fator de conversão `1 célula = 0.5 km` foi inferido do código (`ft_avg * 0.
 | Usuário | `anderson.clemente` |
 | GPU | NVIDIA RTX A4000 (16 GB VRAM) |
 | Repositório | `~/clnn_v2/` |
-| Branch atual | `fix/dataset-doc-improvements` |
+| Branch atual | `feat/official-metrics` |
 | Docker image | `humob:cu128` (~9.2 GB, já construída) |
 
 ### 7.2 Acesso (do WSL Ubuntu no Windows)
@@ -244,6 +253,13 @@ docker run --rm --gpus all -u $(id -u):$(id -g) \
   -e MPLCONFIGDIR=/tmp/mpl \
   -v "$(pwd):/workspace" humob:cu128 \
   python /workspace/run_automate.py --config /workspace/config/exp_full_15d_a4000.yaml
+
+# 5. Calcular métricas oficiais (GEO-BLEU + DTW)
+docker run --rm --gpus all -u $(id -u):$(id -g) \
+  -e PYTHONPATH=/workspace \
+  -e MPLCONFIGDIR=/tmp/mpl \
+  -v "$(pwd):/workspace" humob:cu128 \
+  python /workspace/evaluate_metrics.py
 ```
 
 **Notas de acesso:**
@@ -256,19 +272,10 @@ docker run --rm --gpus all -u $(id -u):$(id -g) \
 
 ## 8. Próximos Passos para o Artigo
 
-### 8.1 🔴 Crítico — Implementar Métricas Oficiais
+### 8.1 ✅ Implementar Métricas Oficiais — CONCLUÍDO
 
-Sem GEO-BLEU e DTW, os resultados não são publicáveis no contexto do HuMob/SIGSPATIAL.
-
-```
-Tarefas:
-- Instalar geobleu: pip install geobleu (Yahoo Japan)
-  https://github.com/yahoojapan/geobleu
-- Adaptar evaluate_model em train.py para calcular GEO-BLEU e DTW
-  além de MSE/cell_error
-- Re-avaliar os modelos treinados com as métricas corretas
-- Reportar resultados no formato do challenge (uid, city, day, slot, x, y)
-```
+GEO-BLEU e DTW implementados em `src/utils/metrics.py` e `evaluate_metrics.py`.
+Resultados: B=0.1017/174.70 | C=0.0276/236.92 | D=0.1076/156.91
 
 ### 8.2 🔴 Crítico — Avaliação no Formato do Challenge
 
@@ -281,19 +288,7 @@ Tarefas:
 - Comparar com baseline e top performers do HuMob 2024
 ```
 
-### 8.3 🟡 Importante — Análise da Cidade C
-
-A cidade C tem erro 2× maior que B e D. Antes de re-treinar, entender por quê:
-
-```
-Tarefas:
-- Analisar distribuição geográfica dos erros (heatmap na grade 200×200)
-- Comparar densidade de dados de treino por cidade
-- Verificar se a esparsidade dos usuários em C é maior
-- Plotar trajetórias preditas vs reais para amostras de C
-```
-
-### 8.4 🟡 Importante — Aumentar Capacidade do Modelo
+### 8.3 🟡 Importante — Aumentar Capacidade do Modelo
 
 Os top performers do HuMob 2024 usaram Transformers. Melhorias imediatas sem mudar a arquitetura:
 
@@ -305,28 +300,24 @@ Tarefas:
 - Re-treinar e comparar resultados
 ```
 
-### 8.5 🟢 Desejável — Ampliar Cobertura de Usuários
+### 8.4 🟢 Desejável — Ampliar Cobertura de Usuários
 
 Para cobrir mais usuários no artigo:
 
 ```
 Opção A (sem re-treino): Avaliar usuários com seq_len adaptativo
   - Usuários com 360-719 registros → usar seq_len=360 para avaliação
-  - Limitação: comparação não é direta
 
 Opção B (com re-treino): Treinar com seq_len menor (360 ou 240)
   - Mais usuários cobertos, menos contexto por predição
   - Estimativa: 2× mais usuários com seq_len=360
 ```
 
-### 8.6 🟢 Desejável — Modelar Transição entre Cidades
-
-O problema real é prever onde o usuário estará, independente da cidade. O modelo atual trata cada cidade isoladamente.
+### 8.5 🟢 Desejável — Modelar Transição entre Cidades
 
 ```
 Ideia: Treinar um modelo unificado com todos os usuários de todas as cidades,
 usando city_embedding para diferenciar contextos, mas sem fine-tuning separado.
-Isso poderia capturar padrões de transição entre cidades.
 ```
 
 ---
@@ -350,9 +341,11 @@ clnn_v2/
 │   │   ├── finetune.py             # finetune_model + sequential_finetuning + compare_models_performance
 │   │   └── pipeline.py             # generate_humob_submission + generate_pred_gt_parquet
 │   └── utils/
+│       ├── metrics.py              # ★ compute_geobleu() + compute_dtw() (métricas oficiais)
 │       ├── mlflow_tracker.py       # HuMobMLflowTracker
 │       └── simple_checkpoint.py    # save/load/cleanup checkpoints
 ├── run_automate.py                 # ★ Ponto de entrada principal
+├── evaluate_metrics.py             # ★ GEO-BLEU + DTW sobre pred_gt_all_users.parquet
 ├── eval_comparison.py              # Re-avaliação MLflow correto (zero-shot vs FT)
 ├── generate_full_eval.py           # Pred+GT para todos os usuários disponíveis
 ├── dockerfile                      # pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
@@ -373,3 +366,4 @@ clnn_v2/
 | Container | Docker `humob:cu128` (~9.2 GB) |
 | Hardware | NVIDIA RTX A4000 (16 GB VRAM) |
 | OS servidor | Linux (domínio `orion.net`, UFAL) |
+| Métricas oficiais | geobleu (Yahoo Japan) + fastdtw |
