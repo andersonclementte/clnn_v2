@@ -3,7 +3,7 @@ Re-avaliação dos modelos treinados com logging correto no MLflow.
 Roda sem re-treinar — usa modelos já salvos.
 """
 import os, torch, mlflow
-os.chdir("/home/anderson.clemente@orion.net/clnn_v2")
+os.chdir("/workspace")
 
 from src.training.train import evaluate_model
 
