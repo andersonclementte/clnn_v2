@@ -40,7 +40,7 @@ for city_code, city_name in CITY_MAP.items():
 
 # Resumo final
 print("=" * 50)
-print(f"{Cidade:<8} {GEO-BLEU:>10} {DTW:>10} {Usuarios:>10}")
+print("{:<8} {:>10} {:>10} {:>10}".format("Cidade", "GEO-BLEU", "DTW", "Usuarios"))
 print("-" * 50)
 for city_name, m in results.items():
     print(f"{city_name:<8} {m['geo_bleu']:>10.4f} {m['dtw']:>10.2f} {m['n_users']:>10}")
