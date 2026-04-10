@@ -75,6 +75,16 @@ def run_from_yaml(cfg_path: str) -> None:
     n_clusters = int(_get(cfg, "model.n_clusters", 32))
     n_users = int(_get(cfg, "model.n_users", 1000))
     seq_len = int(_get(cfg, "model.sequence_length", 12))
+    # Fase 1: arch params (com defaults v1 para retrocompatibilidade)
+    user_emb_dim = int(_get(cfg, "model.user_emb_dim", 4))
+    city_emb_dim = int(_get(cfg, "model.city_emb_dim", 4))
+    temporal_dim = int(_get(cfg, "model.temporal_dim", 8))
+    poi_out_dim = int(_get(cfg, "model.poi_out_dim", 4))
+    lstm_hidden = int(_get(cfg, "model.lstm_hidden", 4))
+    fusion_dim = int(_get(cfg, "model.fusion_dim", 8))
+    # Fase 2: loss alpha (peso do MSE auxiliar)
+    loss_alpha = float(_get(cfg, "model.loss_alpha", 0.1))
+    max_seq_per_user = int(_get(cfg, "model.max_sequences_per_user", 50))
 
     base_cfg = _get(cfg, "training.base", {}) or {}
     ft_cfg = _get(cfg, "training.finetune", {}) or {}
@@ -100,6 +110,9 @@ def run_from_yaml(cfg_path: str) -> None:
     print("⚙️  Parâmetros resolvidos:")
     print(f"   device={device}, num_workers={num_workers}, pin_memory={pin_memory}")
     print(f"   n_clusters={n_clusters}, n_users={n_users}, sequence_length={seq_len}")
+    print(f"   arch: user_emb={user_emb_dim}, city_emb={city_emb_dim}, temporal={temporal_dim}, "
+          f"poi_out={poi_out_dim}, lstm_hidden={lstm_hidden}, fusion={fusion_dim}")
+    print(f"   loss_alpha={loss_alpha}")
     print(f"   base: epochs={base_epochs}, bs={base_bs}, lr={base_lr}, amp={base_mixed}, city={base_city}")
     print(f"   ft:   epochs={ft_epochs},  bs={ft_bs},  lr={ft_lr},  cities={ft_cities}")
 
@@ -133,6 +146,14 @@ def run_from_yaml(cfg_path: str) -> None:
         n_users=n_users,
         save_path=base_ckpt.as_posix(),
         mlflow_tracker=tracker,
+        user_emb_dim=user_emb_dim,
+        city_emb_dim=city_emb_dim,
+        temporal_dim=temporal_dim,
+        poi_out_dim=poi_out_dim,
+        lstm_hidden=lstm_hidden,
+        fusion_dim=fusion_dim,
+        loss_alpha=loss_alpha,
+        max_sequences_per_user=max_seq_per_user,
     )
     print(f"   ✅ Treino base concluído -> {base_ckpt.name}")
 

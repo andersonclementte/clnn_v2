@@ -1,0 +1,54 @@
+experiment_name: humob_v2_smoke
+logging:
+  tracking_uri: "file:./mlruns"
+
+data:
+  parquet_file: "humob_all_cities_v2_normalized.parquet"
+  base_city: "A"
+  finetune_cities: ["B", "C", "D"]
+
+model:
+  n_clusters: 16
+  n_users: 100000
+  sequence_length: 12
+  max_sequences_per_user: 2   # limita sequencias por usuario — mantém smoke rápido
+  # Fase 1 — reparametrização
+  user_emb_dim: 32
+  city_emb_dim: 8
+  temporal_dim: 16
+  poi_out_dim: 16
+  lstm_hidden: 64     # bidirecional → 128-D de saída
+  fusion_dim: 128
+  # Fase 2 — loss CE + MSE auxiliar
+  loss_alpha: 0.1     # peso do MSE (loss = CE + alpha * MSE)
+
+training:
+  base:
+    n_epochs: 1
+    learning_rate: 3e-4
+    batch_size: 16
+    mixed_precision: true
+  finetune:
+    n_epochs: 1
+    learning_rate: 5e-5
+    batch_size: 8
+
+hardware:
+  device: "cuda"
+  pin_memory: true
+  num_workers: 0
+
+eval:
+  compare: true
+  n_samples: 200
+  pred_gt:
+    enabled: false
+
+submission:
+  enabled: false
+
+outputs:
+  models_path: "outputs/models/"
+  submissions_path: "outputs/submissions/"
+  plots_path: "outputs/plots/"
+  eval_path: "outputs/eval/"

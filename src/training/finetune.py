@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import pandas as pd
@@ -8,6 +9,7 @@ import os
 from datetime import datetime
 
 from src.models.humob_model import HuMobModel
+from src.training.train import find_nearest_cluster
 from src.data.dataset import HuMobNormalizedDataset
 
 from src.utils.mlflow_tracker import HuMobMLflowTracker
@@ -50,7 +52,8 @@ def finetune_model(
     mlflow_tracker: HuMobMLflowTracker = None,
     base_run_id: str = None,
     resume_from_checkpoint: bool = True,
-    checkpoint_every_n_epochs: int = 1
+    checkpoint_every_n_epochs: int = 1,
+    loss_alpha: float = 0.1,
 ):
     """Fine-tuning do modelo pré-treinado em uma cidade específica."""
     print(f"🎯 FINE-TUNING NA CIDADE {target_city}")
@@ -108,6 +111,12 @@ def finetune_model(
         cluster_centers=centers,
         sequence_length=sequence_length,
         prediction_steps=int(config.get('prediction_steps', 1)),
+        user_emb_dim=int(config.get('user_emb_dim', 4)),
+        city_emb_dim=int(config.get('city_emb_dim', 4)),
+        temporal_dim=int(config.get('temporal_dim', 8)),
+        poi_out_dim=int(config.get('poi_out_dim', 4)),
+        lstm_hidden=int(config.get('lstm_hidden', 4)),
+        fusion_dim=int(config.get('fusion_dim', 8)),
     ).to(device)
 
     model.load_state_dict(state, strict=True)
@@ -166,7 +175,7 @@ def finetune_model(
         optimizer, T_max=n_epochs, eta_min=learning_rate/10
     )
     
-    criterion = nn.MSELoss()
+    # loss_alpha controla o peso do MSE auxiliar (CE e a loss principal)
     
     # Checkpoint
     start_epoch = 0
@@ -175,10 +184,16 @@ def finetune_model(
     if resume_from_checkpoint:
         latest = get_latest_checkpoint(checkpoint_dir, pattern="checkpoint_epoch_*.pt")
         if latest:
-            print(f"🔄 Retomando fine-tuning: {latest}")
-            start_epoch, _ = load_training_checkpoint(
-                model, optimizer, latest, map_location="cpu", strict=True, scheduler=scheduler
-            )
+            try:
+                print(f"🔄 Tentando retomar fine-tuning: {latest}")
+                start_epoch, _ = load_training_checkpoint(
+                    model, optimizer, latest, map_location="cpu", strict=True, scheduler=scheduler
+                )
+                print(f"✅ Checkpoint carregado: época {start_epoch}")
+            except RuntimeError as e:
+                print(f"⚠️  Checkpoint incompatível (arquitetura mudou): {e}")
+                print("🚀 Ignorando checkpoint e iniciando do zero.")
+                start_epoch = 0
 
     
     best_val_loss = float('inf')
@@ -221,7 +236,15 @@ def finetune_model(
                 if not torch.isfinite(pred).all():
                     continue
 
-                loss = criterion(pred, target)
+                # Loss: CE sobre cluster + MSE auxiliar
+                target_cluster = find_nearest_cluster(target, model.destination_head.centers)
+                _, logits = model.forward_single_step(
+                    uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq,
+                    return_logits=True
+                )
+                loss_ce = F.cross_entropy(logits, target_cluster)
+                loss_mse = F.mse_loss(pred, target)
+                loss = loss_ce + loss_alpha * loss_mse
                 if not torch.isfinite(loss):
                     continue
 
@@ -256,7 +279,14 @@ def finetune_model(
                     ]
                     pred = model.forward_single_step(uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq)
                     target = target_coords.squeeze(1)
-                    vloss = criterion(pred, target)
+                    target_cluster_v = find_nearest_cluster(target, model.destination_head.centers)
+                    _, logits_v = model.forward_single_step(
+                        uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq,
+                        return_logits=True
+                    )
+                    loss_ce_v = F.cross_entropy(logits_v, target_cluster_v)
+                    loss_mse_v = F.mse_loss(pred, target)
+                    vloss = loss_ce_v + loss_alpha * loss_mse_v
 
                     bs = target.size(0)
                     val_loss_epoch += float(vloss.item()) * bs

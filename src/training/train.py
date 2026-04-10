@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import pandas as pd
@@ -15,6 +16,19 @@ from src.data.dataset import create_humob_loaders, create_test_loader
 
 # MLflow - Import do tracker personalizado
 from src.utils.mlflow_tracker import HuMobMLflowTracker
+
+def find_nearest_cluster(target_coords: torch.Tensor, cluster_centers: torch.Tensor) -> torch.Tensor:
+    """Retorna indice do cluster mais proximo para cada ponto alvo.
+    Args:
+        target_coords: (B, 2) coordenadas normalizadas
+        cluster_centers: (C, 2) centros dos clusters
+    Returns:
+        (B,) indices LongTensor
+    """
+    dists = torch.cdist(target_coords.float(), cluster_centers.float())  # (B, C)
+    return dists.argmin(dim=1)  # (B,)
+
+
 from src.utils.simple_checkpoint import (
     save_checkpoint,
     load_training_checkpoint,
@@ -167,7 +181,15 @@ def train_humob_model(
     mlflow_tracker: HuMobMLflowTracker = None,
     resume_from_checkpoint: bool = True,
     checkpoint_every_n_epochs: int = 1,
-    keep_last_n_checkpoints: int = 3
+    keep_last_n_checkpoints: int = 3,
+    user_emb_dim: int = 4,
+    city_emb_dim: int = 4,
+    temporal_dim: int = 8,
+    poi_out_dim: int = 4,
+    lstm_hidden: int = 4,
+    fusion_dim: int = 8,
+    loss_alpha: float = 0.1,
+    max_sequences_per_user: int = 50,
 ):
     """Treina o modelo HuMob com dados normalizados e tracking MLflow."""
     print("🏋️ Iniciando treinamento do modelo HuMob...")
@@ -197,14 +219,21 @@ def train_humob_model(
         parquet_path=parquet_path,
         cities=cities,
         batch_size=batch_size,
-        sequence_length=sequence_length
+        sequence_length=sequence_length,
+        max_sequences_per_user=max_sequences_per_user
     )
     
     # 2. Instancia modelo
     model = HuMobModel(
         n_users=n_users,
-        n_cities=4,  # A, B, C, D
+        n_cities=4,
         cluster_centers=cluster_centers,
+        user_emb_dim=user_emb_dim,
+        city_emb_dim=city_emb_dim,
+        temporal_dim=temporal_dim,
+        poi_out_dim=poi_out_dim,
+        lstm_hidden=lstm_hidden,
+        fusion_dim=fusion_dim,
         sequence_length=sequence_length,
         prediction_steps=1
     ).to(device)
@@ -213,7 +242,7 @@ def train_humob_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, 
                                  betas=(0.9, 0.95), weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=2)
-    criterion = nn.MSELoss()
+    # loss_alpha controla o peso do MSE auxiliar (CE e a loss principal)
 
     def grad_norm(model):
         """Calcula norma total dos gradientes"""
@@ -234,9 +263,15 @@ def train_humob_model(
 
     latest = get_latest_checkpoint("outputs/models/checkpoints", "checkpoint_epoch_*.pt")
     if latest:
-        print(f"🔁 Retomando de {latest}")
-        start_epoch, _ = load_training_checkpoint(model, optimizer, latest, map_location="cpu", strict=True,
-                                                scheduler=scheduler if 'scheduler' in locals() else None)
+        try:
+            print(f"🔁 Tentando retomar de {latest}")
+            start_epoch, _ = load_training_checkpoint(model, optimizer, latest, map_location="cpu", strict=True,
+                                                    scheduler=scheduler if 'scheduler' in locals() else None)
+            print(f"✅ Checkpoint carregado: época {start_epoch}")
+        except RuntimeError as e:
+            print(f"⚠️  Checkpoint incompatível (arquitetura mudou): {e}")
+            print("🚀 Ignorando checkpoint e iniciando do zero.")
+            start_epoch = 0
     else:
         print("🚀 Nenhum checkpoint encontrado, iniciando do zero")
         start_epoch = 0
@@ -273,8 +308,15 @@ def train_humob_model(
                     print("⚠️ Predição contém NaN/Inf, pulando batch")
                     continue
                 
-                # Loss
-                loss = criterion(pred, target)
+                # Loss: CE sobre cluster + MSE auxiliar
+                target_cluster = find_nearest_cluster(target, model.destination_head.centers)
+                _, logits = model.forward_single_step(
+                    uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq,
+                    return_logits=True
+                )
+                loss_ce = F.cross_entropy(logits, target_cluster)
+                loss_mse = F.mse_loss(pred, target)
+                loss = loss_ce + loss_alpha * loss_mse
                 
                 if not torch.isfinite(loss):
                     print(f"⚠️ Loss={loss.item()} não finito, pulando batch")
@@ -373,6 +415,12 @@ def train_humob_model(
                     'sequence_length': sequence_length,
                     'prediction_steps': 1,
                     'n_clusters': int(centers_tensor.shape[0]),
+                    'user_emb_dim': user_emb_dim,
+                    'city_emb_dim': city_emb_dim,
+                    'temporal_dim': temporal_dim,
+                    'poi_out_dim': poi_out_dim,
+                    'lstm_hidden': lstm_hidden,
+                    'fusion_dim': fusion_dim,
                 },
                 'train_loss': float(avg_train_loss),
                 'mlflow_run_id': run_id
@@ -412,7 +460,13 @@ def train_humob_model(
                     'n_cities': 4,
                     'sequence_length': sequence_length,
                     'prediction_steps': 1,
-                    'n_clusters': cluster_centers.shape[0]
+                    'n_clusters': cluster_centers.shape[0],
+                    'user_emb_dim': user_emb_dim,
+                    'city_emb_dim': city_emb_dim,
+                    'temporal_dim': temporal_dim,
+                    'poi_out_dim': poi_out_dim,
+                    'lstm_hidden': lstm_hidden,
+                    'fusion_dim': fusion_dim,
                 },
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
