@@ -184,10 +184,16 @@ def finetune_model(
     if resume_from_checkpoint:
         latest = get_latest_checkpoint(checkpoint_dir, pattern="checkpoint_epoch_*.pt")
         if latest:
-            print(f"🔄 Retomando fine-tuning: {latest}")
-            start_epoch, _ = load_training_checkpoint(
-                model, optimizer, latest, map_location="cpu", strict=True, scheduler=scheduler
-            )
+            try:
+                print(f"🔄 Tentando retomar fine-tuning: {latest}")
+                start_epoch, _ = load_training_checkpoint(
+                    model, optimizer, latest, map_location="cpu", strict=True, scheduler=scheduler
+                )
+                print(f"✅ Checkpoint carregado: época {start_epoch}")
+            except RuntimeError as e:
+                print(f"⚠️  Checkpoint incompatível (arquitetura mudou): {e}")
+                print("🚀 Ignorando checkpoint e iniciando do zero.")
+                start_epoch = 0
 
     
     best_val_loss = float('inf')

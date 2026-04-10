@@ -189,6 +189,7 @@ def train_humob_model(
     lstm_hidden: int = 4,
     fusion_dim: int = 8,
     loss_alpha: float = 0.1,
+    max_sequences_per_user: int = 50,
 ):
     """Treina o modelo HuMob com dados normalizados e tracking MLflow."""
     print("🏋️ Iniciando treinamento do modelo HuMob...")
@@ -218,7 +219,8 @@ def train_humob_model(
         parquet_path=parquet_path,
         cities=cities,
         batch_size=batch_size,
-        sequence_length=sequence_length
+        sequence_length=sequence_length,
+        max_sequences_per_user=max_sequences_per_user
     )
     
     # 2. Instancia modelo
@@ -261,9 +263,15 @@ def train_humob_model(
 
     latest = get_latest_checkpoint("outputs/models/checkpoints", "checkpoint_epoch_*.pt")
     if latest:
-        print(f"🔁 Retomando de {latest}")
-        start_epoch, _ = load_training_checkpoint(model, optimizer, latest, map_location="cpu", strict=True,
-                                                scheduler=scheduler if 'scheduler' in locals() else None)
+        try:
+            print(f"🔁 Tentando retomar de {latest}")
+            start_epoch, _ = load_training_checkpoint(model, optimizer, latest, map_location="cpu", strict=True,
+                                                    scheduler=scheduler if 'scheduler' in locals() else None)
+            print(f"✅ Checkpoint carregado: época {start_epoch}")
+        except RuntimeError as e:
+            print(f"⚠️  Checkpoint incompatível (arquitetura mudou): {e}")
+            print("🚀 Ignorando checkpoint e iniciando do zero.")
+            start_epoch = 0
     else:
         print("🚀 Nenhum checkpoint encontrado, iniciando do zero")
         start_epoch = 0

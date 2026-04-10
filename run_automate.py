@@ -84,6 +84,7 @@ def run_from_yaml(cfg_path: str) -> None:
     fusion_dim = int(_get(cfg, "model.fusion_dim", 8))
     # Fase 2: loss alpha (peso do MSE auxiliar)
     loss_alpha = float(_get(cfg, "model.loss_alpha", 0.1))
+    max_seq_per_user = int(_get(cfg, "model.max_sequences_per_user", 50))
 
     base_cfg = _get(cfg, "training.base", {}) or {}
     ft_cfg = _get(cfg, "training.finetune", {}) or {}
@@ -152,6 +153,7 @@ def run_from_yaml(cfg_path: str) -> None:
         lstm_hidden=lstm_hidden,
         fusion_dim=fusion_dim,
         loss_alpha=loss_alpha,
+        max_sequences_per_user=max_seq_per_user,
     )
     print(f"   ✅ Treino base concluído -> {base_ckpt.name}")
 
