@@ -1,7 +1,7 @@
 # PRD — CLNN v2: Human Mobility Prediction
 
-> **Última atualização:** 2026-03-31
-> **Contexto:** Este documento consolida todo o conhecimento adquirido até março de 2026, incluindo bugs corrigidos, resultados reais, limitações conhecidas e próximos passos. Escrito para que qualquer LLM ou desenvolvedor possa retomar o trabalho sem perda de contexto.
+> **Última atualização:** 2026-04-10
+> **Contexto:** Este documento consolida todo o conhecimento adquirido até abril de 2026, incluindo bugs corrigidos, resultados reais com métricas oficiais, diagnóstico do modelo atual e plano de implementação para as próximas melhorias. Escrito para que qualquer LLM ou desenvolvedor possa retomar o trabalho sem perda de contexto.
 
 ---
 
@@ -15,7 +15,7 @@
 | 2024 | HuMob Challenge 2024 | YJMob multi-cidade (~4.5 GB) | A, B, C, D | GEO-BLEU, DTW |
 | 2025 | SIGSPATIAL GIS CUP 2025 | LY Corporation (~160 GB) | Multi-cidades | GEO-BLEU, DTW |
 
-**Este projeto usa o dataset do HuMob 2024** (cidades A, B, C, D), mas o objetivo é publicar um artigo e potencialmente adaptar para o SIGSPATIAL GIS CUP 2025 (dados abrem em 30/04/2025 — já passados; o prazo final era 10/09/2025).
+**Este projeto usa o dataset do HuMob 2024** (cidades A, B, C, D), com objetivo de publicar um artigo.
 
 ### 1.2 Definição do Problema
 
@@ -38,14 +38,12 @@
 
 ### 1.4 Métricas Oficiais do Challenge
 
-⚠️ **O modelo atual NÃO usa as métricas oficiais.** Isso precisa ser corrigido antes do artigo.
+✅ **GEO-BLEU e DTW implementados** (`src/utils/metrics.py`, `evaluate_metrics.py`).
 
-| Métrica | Descrição | Melhor valor | Top 2024 |
-|---------|-----------|-------------|----------|
-| **GEO-BLEU** | Similaridade geográfica de trajetórias (dia a dia) | Maior = melhor | 0.319 (Team 22) |
-| **DTW** | Dynamic Time Warping — similaridade temporal de trajetórias | Menor = melhor | 27.15 (Team 24) |
-
-O modelo atual usa MSE e cell_error (erro médio em células), que são métricas de desenvolvimento mas **não comparáveis com outros trabalhos do challenge**.
+| Métrica | Descrição | Melhor valor | Top 2024 | Nosso resultado (médio) |
+|---------|-----------|-------------|----------|------------------------|
+| **GEO-BLEU** | Similaridade geográfica de trajetórias (dia a dia) | Maior = melhor | 0.319 (Team 22) | ~0.079 (B+C+D) |
+| **DTW** | Dynamic Time Warping — similaridade temporal de trajetórias | Menor = melhor | 27.15 (Team 24) | ~189 (B+C+D) |
 
 Implementação de referência: https://github.com/yahoojapan/geobleu
 
@@ -77,18 +75,20 @@ POI Projection        ─┘
               Predicted (x, y) ∈ [0, 1]²
 ```
 
-### 2.2 Parâmetros do Modelo (config atual)
+### 2.2 Parâmetros do Modelo (versão atual — v1)
 
-| Parâmetro | Valor | Observação |
-|-----------|-------|------------|
+| Parâmetro | Valor | Problema identificado |
+|-----------|-------|----------------------|
 | `sequence_length` | 720 | 15 dias × 48 slots |
 | `n_clusters` | 512 | KMeans sobre coordenadas da cidade A |
 | `n_users` | 100.000 | Total de usuários no dataset |
-| Parâmetros treináveis | ~662K | Modelo pequeno para o problema |
-| `lstm_hidden` | pequeno | Provavelmente subparametrizado |
-| `user_emb_dim` | 4 | Muito pequeno para 100K usuários |
+| `lstm_hidden` | **4** (bidirecional → 8-D) | LSTM de 160 params para sequências de 720 passos |
+| `user_emb_dim` | **4** | 400K params gastos em 4 dimensões para 100K usuários |
+| `fusion_dim` | **8** | Toda trajetória + contexto comprimida em 8 números |
+| `poi_out_dim` | **4** | 85 features POI → 4-D é perda brutal |
+| Total params | ~662K | 60% são embedding de usuário; LSTM tem apenas 160 params |
 
-### 2.3 Pipeline de Treinamento
+### 2.3 Pipeline de Treinamento (v1)
 
 1. **KMeans** — Calcula 512 centros de cluster sobre coordenadas da cidade A
 2. **Treino base** — 8 épocas na cidade A (AdamW, ReduceLROnPlateau, AMP)
@@ -97,7 +97,7 @@ POI Projection        ─┘
 
 ---
 
-## 3. Resultados Obtidos (Experimento: exp_full_15d_a4000, rodado em março 2026)
+## 3. Resultados Obtidos (Experimento: exp_full_15d_a4000, março 2026)
 
 ### 3.1 Treinamento Base (Cidade A)
 
@@ -115,7 +115,7 @@ POI Projection        ─┘
 | C | 5 (early stop na 5ª) | 0.00234 |
 | D | 3 (verificar logs) | 0.00231 |
 
-### 3.3 Avaliação Final (Zero-shot vs Fine-tuned)
+### 3.3 Avaliação Final — cell_error (Zero-shot vs Fine-tuned)
 
 Avaliado com `n_samples=1000` usando `evaluate_model`:
 
@@ -125,7 +125,7 @@ Avaliado com `n_samples=1000` usando `evaluate_model`:
 | C | 11.36 células | 10.04 células | -11.6% | 5.68 km | 5.02 km |
 | D | 4.86 células | 4.57 células | -6.0% | 2.43 km | 2.28 km |
 
-### 3.4 Avaliação sobre Todos os Usuários (pred_gt_all_users.parquet)
+### 3.4 Cobertura de Usuários (pred_gt_all_users.parquet)
 
 Avaliado sobre todos os usuários com dados suficientes (`test_days=(0.55, 1.0)`, `max_seqs=30`):
 
@@ -135,13 +135,180 @@ Avaliado sobre todos os usuários com dados suficientes (`test_days=(0.55, 1.0)`
 | C | 1.406 | ~20.000 | 7.1% | **4.30 km** | 5.48 km | 11.01 km |
 | D | 1.970 | ~6.000 | 32.9% | **2.06 km** | 3.87 km | 9.55 km |
 
-**Por que só 5–33% dos usuários?** Com `seq_len=720` (15 dias de contexto), o usuário precisa ter 720 registros consecutivos na cidade. Como os usuários **transitam entre cidades**, a maioria só aparece esporadicamente em B, C, D — a mediana de registros por usuário no período de teste é ~400 (menos que 720).
+**Por que só 5–33% dos usuários?** Com `seq_len=720`, o usuário precisa ter 720 registros consecutivos na cidade. Como os usuários transitam entre cidades, a maioria só aparece esporadicamente em B, C, D.
 
-**Nota sobre cidade C:** erro significativamente maior em todas as métricas. Hipóteses: área geográfica maior, padrões de mobilidade mais heterogêneos, ou menos dados de treino.
+### 3.5 Métricas Oficiais — GEO-BLEU e DTW (rodado em 2026-03-31)
+
+Avaliado sobre `pred_gt_all_users.parquet` (130.007 predições, 5.033 usuários):
+
+| Cidade | Usuários | GEO-BLEU | DTW | GEO-BLEU top 2024 | DTW top 2024 |
+|--------|----------|----------|-----|-------------------|--------------|
+| B | 2.334 | **0.1017** | **174.70** | 0.319 | 27.15 |
+| C | 1.406 | **0.0276** | **236.92** | 0.319 | 27.15 |
+| D | 1.970 | **0.1076** | **156.91** | 0.319 | 27.15 |
+
+**Interpretação:**
+- B e D atingem GEO-BLEU ~0.10 — baseline razoável, mas 3× abaixo do top
+- C apresenta GEO-BLEU 0.027, consistente com cell_error 2× maior observado
+- DTW alto (~175–237 vs 27 do top) indica desvios temporais significativos
+- A diferença para o top é esperada: líderes do HuMob 2024 usaram Transformers com arquiteturas muito maiores
 
 ---
 
-## 4. Bugs Corrigidos (histórico importante)
+## 4. Diagnóstico do Modelo Atual
+
+Análise realizada em 2026-04-10 após inspeção dos pesos salvos (`humob_model_finetuned_B.pt`).
+
+### 4.1 Modelo Severamente Subparametrizado
+
+| Camada | Tamanho atual | Tamanho adequado | Impacto |
+|--------|--------------|-----------------|---------|
+| `lstm_hidden` | **4** (BiLSTM → 8-D) | 64–128 | LSTM com 160 params não captura 720 passos |
+| `user_emb_dim` | **4** para 100K usuários | 32–64 | 4-D não representa identidade do usuário |
+| `fusion_dim` | **8** | 64–128 | Trajetória inteira + contexto em 8 números |
+| `poi_out_dim` | **4** | 16–32 | 85 features POI perdidas |
+
+Os 662K params são enganosos: **400K (60%) são a embedding de usuário `(100000, 4)`** — que tem quase nenhum poder expressivo com apenas 4 dimensões. O LSTM real tem **160 params** apenas.
+
+### 4.2 Loss Function Desalinhada das Métricas
+
+O modelo treina com `MSELoss` em coordenadas `[0,1]`, mas é avaliado com **GEO-BLEU e DTW** que medem similaridade de trajetórias. Não há sinal de treinamento sobre consistência temporal de sequências.
+
+Além disso, o modelo já gera **logits sobre 512 clusters** e depois converte para coordenadas — mas é treinado com MSE nas coordenadas finais, não com cross-entropy nos clusters. O sinal de treinamento é indireto.
+
+### 4.3 LSTM Desperdiça o Contexto da Sequência
+
+`CoordLSTM` usa apenas `h_n[-1]` (último hidden state) para uma sequência de 720 passos. Os 719 hidden states intermediários — que contêm os padrões de movimento ao longo do tempo — são completamente descartados.
+
+### 4.4 Head MLP Desproporcional
+
+A head `8 → 500 → 512` tem **262K params** para uma entrada de **8 dimensões**. É o maior componente do modelo depois das embeddings, mas alimentado por um vetor minúsculo.
+
+### 4.5 Desalinhamento Treino/Avaliação
+
+O modelo treina passo-a-passo (`forward_single_step`), mas é avaliado com rollout autoregressivo de 720 passos. Erros se acumulam durante a avaliação de forma que o modelo nunca viu durante o treino.
+
+---
+
+## 5. Plano de Implementação — v2
+
+### Fase 1 — Reparametrização (🔴 Crítico — sem mudar arquitetura)
+
+**O maior ganho com menor risco.** Apenas mudança de hiperparâmetros no YAML:
+
+```yaml
+# config/exp_v2_reparametrizado.yaml
+model:
+  user_emb_dim: 32      # era 4  → mais expressividade por usuário
+  city_emb_dim: 8       # era 4
+  temporal_dim: 16      # era 8
+  poi_out_dim: 16       # era 4  → aproveita os 85 features POI
+  lstm_hidden: 64       # era 4  → bidirecional produz 128-D
+  fusion_dim: 128       # era 8  → head MLP tem entrada decente
+  n_clusters: 512       # mantém
+```
+
+**Impacto estimado:** O modelo passa de ~2.4M params funcionais (excluindo embedding de usuário que é inutilizada), com o LSTM capaz de modelar dependências temporais reais.
+
+**Arquivos a editar:** `config/exp_full_15d_a4000.yaml` + adicionar args ao `HuMobModel.__init__` lido do YAML.
+
+### Fase 2 — Loss Function (🔴 Crítico — alto impacto)
+
+Substituir `MSELoss` por **cross-entropy sobre os índices de cluster** como loss primária:
+
+```python
+# src/training/train.py — dentro do loop de treino
+# 1. Obter logits (antes da softmax) — requer expor no modelo
+cluster_logits = model.destination_head.mlp(fused)  # (B, n_clusters)
+
+# 2. Calcular índice do cluster mais próximo do target
+target_cluster = find_nearest_cluster(target_coords, cluster_centers)  # (B,)
+
+# 3. Loss principal: CE nos clusters + MSE auxiliar nas coordenadas
+loss_ce = F.cross_entropy(cluster_logits, target_cluster)
+loss_mse = F.mse_loss(pred_coords, target_coords)
+loss = loss_ce + 0.1 * loss_mse
+```
+
+**Por que isso melhora GEO-BLEU/DTW:** O modelo passa a aprender explicitamente "em qual região geográfica o usuário estará", que é o que GEO-BLEU mede. O MSE sobre coordenadas contínuas é um proxy fraco para esse objetivo.
+
+**Arquivos a editar:** `src/models/humob_model.py` (expor logits), `src/training/train.py` (loss), `src/training/finetune.py` (loss).
+
+### Fase 3 — Attention Pooling no LSTM (🟡 Importante)
+
+Em vez de descartar 719 hidden states, adicionar atenção aprendível sobre toda a sequência:
+
+```python
+# src/models/partial_info.py — substituir último hidden por attention pooling
+class CoordLSTM(nn.Module):
+    def __init__(self, ...):
+        ...
+        self.attention = nn.Linear(hidden_size * num_directions, 1)
+
+    def forward(self, x):
+        output, (h_n, _) = self.lstm(x)      # output: (B, 720, hidden*2)
+        scores = self.attention(output)        # (B, 720, 1)
+        weights = F.softmax(scores, dim=1)     # (B, 720, 1)
+        context = (weights * output).sum(dim=1)  # (B, hidden*2)
+        return context
+```
+
+**Por que isso melhora:** O modelo pode aprender a focar em partes relevantes da trajetória (ex: padrões do dia anterior, horários de pico) em vez de usar apenas o último passo.
+
+**Arquivo a editar:** `src/models/partial_info.py`.
+
+### Fase 4 — Scheduled Sampling (🟡 Importante)
+
+Reduz o mismatch entre treino (coordenadas reais como input) e avaliação (coordenadas preditas como input):
+
+```python
+# Durante treino: com probabilidade p_scheduled, usar predição anterior
+# como input em vez da coordenada real. p cresce de 0→0.5 ao longo das épocas.
+if random.random() < p_scheduled:
+    next_input = pred.detach()  # usa predição própria
+else:
+    next_input = ground_truth   # usa dado real (teacher forcing)
+```
+
+**Arquivo a editar:** `src/training/train.py`.
+
+### Fase 5 — Arquitetura Transformer (🟢 Desejável — maior ganho potencial)
+
+Substituir o BiLSTM por um **Transformer Encoder com atenção local** (janela de 48 slots = 1 dia). Os top performers do HuMob 2024 usaram exatamente essa abordagem.
+
+```
+Coord Sequence (720 × 2)
+    ↓ positional encoding
+Transformer Encoder (local attention, window=48)
+    ↓ [CLS] token ou mean pooling
+Context Vector (256-D)
+```
+
+**Considerações:** Sequências de 720 passos com atenção global são O(720²) — pesado. Usar atenção local com janela de 48 (1 dia) ou atenção esparsa é essencial.
+
+**Arquivo a criar:** `src/models/partial_info_transformer.py`.
+
+### Fase 6 — Ampliar Cobertura de Usuários (🟢 Desejável)
+
+Para cobrir mais usuários no artigo (atualmente 7–33%):
+
+```
+Opção A (sem re-treino): seq_len adaptativo na avaliação
+  - Usuários com 360-719 registros → usar seq_len=360
+  - Limitação: comparação direta não é possível
+
+Opção B (re-treino com seq_len=360):
+  - Estimativa: 2× mais usuários cobertos
+  - Menos contexto por predição, potencialmente menor qualidade
+
+Opção C (modelo unificado multi-cidade):
+  - Treinar sem fine-tuning separado, usando city_embedding
+  - Captura padrões de transição entre cidades
+```
+
+---
+
+## 6. Bugs Corrigidos (histórico importante)
 
 ### Bug 1 — `val_days` insuficiente no fine-tuning (`finetune.py`)
 - **Problema:** `val_days=(0.8, 1.0)` = ~15 dias = 720 time steps = exatamente `sequence_length`. Impossível formar sequências válidas → `val_count=0` → `val_loss=0.0`
@@ -150,41 +317,34 @@ Avaliado sobre todos os usuários com dados suficientes (`test_days=(0.55, 1.0)`
 - **Arquivo:** `src/training/finetune.py`, linhas 128 e 138
 
 ### Bug 2 — Flush prematuro do spillover (`dataset.py`)
-- **Problema:** Quando um chunk do parquet não tinha dados relevantes (cidade/período filtrados), o código fazia flush de TODOS os usuários acumulados, mesmo que tivessem dados chegando em chunks futuros
+- **Problema:** Quando um chunk do parquet não tinha dados relevantes, o código fazia flush de TODOS os usuários acumulados, mesmo que tivessem dados chegando em chunks futuros
 - **Sintoma:** Usuários com dados esparsos geravam sequências incompletas
 - **Correção:** Remover o flush e reset de `prev_uids` quando `df is None`; apenas `continue`
 - **Arquivo:** `src/data/dataset.py`, função `__iter__`
 
 ### Bug 3 — MLflow sobrescrevia métricas na comparação (`finetune.py`)
-- **Problema:** `compare_models_performance` logava todos os modelos no mesmo run MLflow → métricas de modelos diferentes se sobrescreviam. Além disso, `model_type` era sempre `"zero_shot"` porque a detecção usava `"fine" in model_name.lower()` mas os nomes eram `"FT B"` (sem "fine")
-- **Sintoma:** Apenas um run de comparação com tag `zero_shot`, métricas finais eram do último modelo avaliado
+- **Problema:** `compare_models_performance` logava todos os modelos no mesmo run MLflow. `model_type` era sempre `"zero_shot"` porque a detecção usava `"fine" in model_name.lower()` mas os nomes eram `"FT B"`
 - **Correção:** Criar run MLflow separado por modelo; corrigir detecção para `any(k in model_name.upper() for k in ["FT", "FINE"])`
 - **Arquivo:** `src/training/finetune.py`, função `compare_models_performance`
 
 ---
 
-## 5. Limitações Conhecidas
+## 7. Limitações Conhecidas
 
-### 5.1 Métricas Incorretas para o Challenge
-O modelo usa MSE e cell_error. As métricas oficiais são **GEO-BLEU** e **DTW**. Sem implementá-las, os resultados não são comparáveis com a literatura do challenge.
+### 7.1 Cobertura de Usuários
+Com `seq_len=720`, apenas 7–33% dos usuários têm dados suficientes para avaliação. Limitação intrínseca do dataset (usuários transitam entre cidades).
 
-### 5.2 Cobertura de Usuários
-Com `seq_len=720`, apenas 7–33% dos usuários têm dados suficientes para avaliação. Isso é uma limitação intrínseca do dataset (usuários transitam entre cidades) e do `seq_len` longo.
+### 7.2 Transição entre Cidades não Modelada
+O modelo trata cada cidade de forma independente. Na realidade, os usuários transitam entre cidades — uma previsão mais realista deveria considerar a trajetória global.
 
-### 5.3 Modelo Possivelmente Subparametrizado
-~662K parâmetros para 100K usuários com sequências de 720 pontos pode ser insuficiente. Os top performers do HuMob 2024 usaram Transformers, BERT, e modelos maiores.
-
-### 5.4 Transição entre Cidades não Modelada
-O modelo trata cada cidade de forma independente. Na realidade, os usuários transitam entre cidades — uma previsão mais realista deveria considerar a trajetória global do indivíduo, não apenas dentro de uma cidade.
-
-### 5.5 Conversão km não Verificada Empiricamente
+### 7.3 Conversão km não Verificada Empiricamente
 O fator de conversão `1 célula = 0.5 km` foi inferido do código (`ft_avg * 0.5`). Não foi verificado contra a documentação oficial do dataset YJMob.
 
 ---
 
-## 6. Estado Atual dos Arquivos
+## 8. Estado Atual dos Arquivos
 
-### 6.1 Modelos Salvos (no servidor `cia6`, pasta `~/clnn_v2/`)
+### 8.1 Modelos Salvos (no servidor `cia6`, pasta `~/clnn_v2/`)
 
 | Arquivo | Descrição | Data |
 |---------|-----------|------|
@@ -193,26 +353,27 @@ O fator de conversão `1 célula = 0.5 km` foi inferido do código (`ft_avg * 0.
 | `humob_model_finetuned_C.pt` | Fine-tuned cidade C (val_loss=0.00234) | 2026-03-31 |
 | `humob_model_finetuned_D.pt` | Fine-tuned cidade D (última da cadeia) | 2026-03-31 |
 
-### 6.2 Artefatos de Avaliação
+### 8.2 Artefatos de Avaliação
 
 | Arquivo | Descrição |
 |---------|-----------|
 | `outputs/eval/pred_gt_all_users.parquet` | 130.007 predições, 5.033 usuários, dias 61–75 |
-| `mlruns/` | Todos os runs MLflow (treino, finetuning, comparação) |
+| `mlruns/` | Todos os runs MLflow (treino, finetuning, comparação, métricas oficiais) |
 
-### 6.3 Scripts Importantes
+### 8.3 Scripts Importantes
 
 | Script | Descrição |
 |--------|-----------|
 | `run_automate.py` | Pipeline principal (YAML → KMeans → treino → FT → avaliação) |
 | `eval_comparison.py` | Re-avaliação zero-shot vs FT com MLflow correto |
 | `generate_full_eval.py` | Gera pred_gt para todos os usuários disponíveis |
+| `evaluate_metrics.py` | ★ Calcula GEO-BLEU e DTW oficiais a partir do parquet existente |
 
 ---
 
-## 7. Infraestrutura de Acesso
+## 9. Infraestrutura de Acesso
 
-### 7.1 Servidor de Treinamento
+### 9.1 Servidor de Treinamento
 
 | Item | Valor |
 |------|-------|
@@ -220,17 +381,16 @@ O fator de conversão `1 célula = 0.5 km` foi inferido do código (`ft_avg * 0.
 | Usuário | `anderson.clemente` |
 | GPU | NVIDIA RTX A4000 (16 GB VRAM) |
 | Repositório | `~/clnn_v2/` |
-| Branch atual | `fix/dataset-doc-improvements` |
+| Branch principal | `main` |
 | Docker image | `humob:cu128` (~9.2 GB, já construída) |
 
-### 7.2 Acesso (do WSL Ubuntu no Windows)
+### 9.2 Acesso (do WSL Ubuntu no Windows)
 
 ```bash
 # 1. VPN (terminal 1 — deixar rodando)
 sudo openvpn --config ~/client.ovpn
 
 # 2. SSH (terminal 2)
-wsl -d Ubuntu   # se abrir PowerShell
 ssh anderson.clemente@192.168.222.252
 
 # 3. Tmux no servidor
@@ -244,6 +404,13 @@ docker run --rm --gpus all -u $(id -u):$(id -g) \
   -e MPLCONFIGDIR=/tmp/mpl \
   -v "$(pwd):/workspace" humob:cu128 \
   python /workspace/run_automate.py --config /workspace/config/exp_full_15d_a4000.yaml
+
+# 5. Calcular métricas oficiais (GEO-BLEU + DTW)
+docker run --rm --gpus all -u $(id -u):$(id -g) \
+  -e PYTHONPATH=/workspace \
+  -e MPLCONFIGDIR=/tmp/mpl \
+  -v "$(pwd):/workspace" humob:cu128 \
+  python /workspace/evaluate_metrics.py
 ```
 
 **Notas de acesso:**
@@ -254,84 +421,7 @@ docker run --rm --gpus all -u $(id -u):$(id -g) \
 
 ---
 
-## 8. Próximos Passos para o Artigo
-
-### 8.1 🔴 Crítico — Implementar Métricas Oficiais
-
-Sem GEO-BLEU e DTW, os resultados não são publicáveis no contexto do HuMob/SIGSPATIAL.
-
-```
-Tarefas:
-- Instalar geobleu: pip install geobleu (Yahoo Japan)
-  https://github.com/yahoojapan/geobleu
-- Adaptar evaluate_model em train.py para calcular GEO-BLEU e DTW
-  além de MSE/cell_error
-- Re-avaliar os modelos treinados com as métricas corretas
-- Reportar resultados no formato do challenge (uid, city, day, slot, x, y)
-```
-
-### 8.2 🔴 Crítico — Avaliação no Formato do Challenge
-
-O challenge pede predição **completa** dos dias 61–75 para todos os usuários alvo (3.000 por cidade). O modelo atual prediz sequências amostradas, não o rollout completo.
-
-```
-Tarefas:
-- Verificar se generate_humob_submission.py gera o formato correto
-- Rodar submissão para as 3 cidades e calcular GEO-BLEU/DTW
-- Comparar com baseline e top performers do HuMob 2024
-```
-
-### 8.3 🟡 Importante — Análise da Cidade C
-
-A cidade C tem erro 2× maior que B e D. Antes de re-treinar, entender por quê:
-
-```
-Tarefas:
-- Analisar distribuição geográfica dos erros (heatmap na grade 200×200)
-- Comparar densidade de dados de treino por cidade
-- Verificar se a esparsidade dos usuários em C é maior
-- Plotar trajetórias preditas vs reais para amostras de C
-```
-
-### 8.4 🟡 Importante — Aumentar Capacidade do Modelo
-
-Os top performers do HuMob 2024 usaram Transformers. Melhorias imediatas sem mudar a arquitetura:
-
-```
-Tarefas:
-- Aumentar user_emb_dim: 4 → 32
-- Aumentar lstm_hidden (verificar valor atual em partial_info.py)
-- Aumentar fusion_dim: 8 → 64
-- Re-treinar e comparar resultados
-```
-
-### 8.5 🟢 Desejável — Ampliar Cobertura de Usuários
-
-Para cobrir mais usuários no artigo:
-
-```
-Opção A (sem re-treino): Avaliar usuários com seq_len adaptativo
-  - Usuários com 360-719 registros → usar seq_len=360 para avaliação
-  - Limitação: comparação não é direta
-
-Opção B (com re-treino): Treinar com seq_len menor (360 ou 240)
-  - Mais usuários cobertos, menos contexto por predição
-  - Estimativa: 2× mais usuários com seq_len=360
-```
-
-### 8.6 🟢 Desejável — Modelar Transição entre Cidades
-
-O problema real é prever onde o usuário estará, independente da cidade. O modelo atual trata cada cidade isoladamente.
-
-```
-Ideia: Treinar um modelo unificado com todos os usuários de todas as cidades,
-usando city_embedding para diferenciar contextos, mas sem fine-tuning separado.
-Isso poderia capturar padrões de transição entre cidades.
-```
-
----
-
-## 9. Estrutura do Projeto
+## 10. Estrutura do Projeto
 
 ```
 clnn_v2/
@@ -344,15 +434,17 @@ clnn_v2/
 │   ├── models/
 │   │   ├── humob_model.py          # HuMobModel + discretize_coordinates
 │   │   ├── external_info.py        # ExternalInformationFusionNormalized
-│   │   └── partial_info.py         # CoordLSTM (BiLSTM)
+│   │   └── partial_info.py         # CoordLSTM (BiLSTM) — Fase 3: adicionar attention pooling
 │   ├── training/
-│   │   ├── train.py                # train_humob_model + evaluate_model + compute_cluster_centers
-│   │   ├── finetune.py             # finetune_model + sequential_finetuning + compare_models_performance
+│   │   ├── train.py                # train_humob_model + evaluate_model — Fase 2: loss CE
+│   │   ├── finetune.py             # finetune_model + sequential_finetuning
 │   │   └── pipeline.py             # generate_humob_submission + generate_pred_gt_parquet
 │   └── utils/
+│       ├── metrics.py              # ★ compute_geobleu() + compute_dtw() (métricas oficiais)
 │       ├── mlflow_tracker.py       # HuMobMLflowTracker
 │       └── simple_checkpoint.py    # save/load/cleanup checkpoints
 ├── run_automate.py                 # ★ Ponto de entrada principal
+├── evaluate_metrics.py             # ★ GEO-BLEU + DTW sobre pred_gt_all_users.parquet
 ├── eval_comparison.py              # Re-avaliação MLflow correto (zero-shot vs FT)
 ├── generate_full_eval.py           # Pred+GT para todos os usuários disponíveis
 ├── dockerfile                      # pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
@@ -362,7 +454,7 @@ clnn_v2/
 
 ---
 
-## 10. Stack Tecnológica
+## 11. Stack Tecnológica
 
 | Componente | Tecnologia |
 |---|---|
@@ -373,3 +465,4 @@ clnn_v2/
 | Container | Docker `humob:cu128` (~9.2 GB) |
 | Hardware | NVIDIA RTX A4000 (16 GB VRAM) |
 | OS servidor | Linux (domínio `orion.net`, UFAL) |
+| Métricas oficiais | geobleu (Yahoo Japan) + fastdtw |
