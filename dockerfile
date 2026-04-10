@@ -23,7 +23,8 @@ WORKDIR /workspace
 COPY requirements.txt /tmp/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip && \
-    python -m pip install --no-cache-dir -r /tmp/requirements.txt
+    python -m pip install --no-cache-dir -r /tmp/requirements.txt && \
+    python -m pip install --no-cache-dir git+https://github.com/yahoojapan/geobleu.git fastdtw
 
 # Usuário não-root para rodar a app
 RUN groupadd -g ${GID} appuser && useradd -m -u ${UID} -g ${GID} appuser
