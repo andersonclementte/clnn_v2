@@ -1,6 +1,6 @@
 experiment_name: humob_v2_smoke
 logging:
-  tracking_uri: "file:./mlruns"
+  tracking_uri: "file:/tmp/mlruns"
 
 data:
   parquet_file: "humob_all_cities_v2_normalized.parquet"
