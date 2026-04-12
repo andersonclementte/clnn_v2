@@ -21,6 +21,8 @@ model:
   fusion_dim: 128
   # Fase 2 — loss CE + MSE auxiliar
   loss_alpha: 0.1     # peso do MSE (loss = CE + alpha * MSE)
+  # Fase 4 — scheduled sampling
+  max_scheduled_p: 0.5   # prob. max de substituir último passo pelo pred do modelo
 
 training:
   base:

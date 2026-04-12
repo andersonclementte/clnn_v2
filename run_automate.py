@@ -85,6 +85,7 @@ def run_from_yaml(cfg_path: str) -> None:
     # Fase 2: loss alpha (peso do MSE auxiliar)
     loss_alpha = float(_get(cfg, "model.loss_alpha", 0.1))
     max_seq_per_user = int(_get(cfg, "model.max_sequences_per_user", 50))
+    max_scheduled_p = float(_get(cfg, "model.max_scheduled_p", 0.0))
 
     base_cfg = _get(cfg, "training.base", {}) or {}
     ft_cfg = _get(cfg, "training.finetune", {}) or {}
@@ -112,7 +113,7 @@ def run_from_yaml(cfg_path: str) -> None:
     print(f"   n_clusters={n_clusters}, n_users={n_users}, sequence_length={seq_len}")
     print(f"   arch: user_emb={user_emb_dim}, city_emb={city_emb_dim}, temporal={temporal_dim}, "
           f"poi_out={poi_out_dim}, lstm_hidden={lstm_hidden}, fusion={fusion_dim}")
-    print(f"   loss_alpha={loss_alpha}")
+    print(f"   loss_alpha={loss_alpha}, max_scheduled_p={max_scheduled_p}")
     print(f"   base: epochs={base_epochs}, bs={base_bs}, lr={base_lr}, amp={base_mixed}, city={base_city}")
     print(f"   ft:   epochs={ft_epochs},  bs={ft_bs},  lr={ft_lr},  cities={ft_cities}")
 
@@ -154,6 +155,7 @@ def run_from_yaml(cfg_path: str) -> None:
         fusion_dim=fusion_dim,
         loss_alpha=loss_alpha,
         max_sequences_per_user=max_seq_per_user,
+        max_scheduled_p=max_scheduled_p,
     )
     print(f"   ✅ Treino base concluído -> {base_ckpt.name}")
 

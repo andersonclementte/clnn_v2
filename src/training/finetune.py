@@ -54,6 +54,7 @@ def finetune_model(
     resume_from_checkpoint: bool = True,
     checkpoint_every_n_epochs: int = 1,
     loss_alpha: float = 0.1,
+    max_scheduled_p: float = 0.0,
 ):
     """Fine-tuning do modelo pré-treinado em uma cidade específica."""
     print(f"🎯 FINE-TUNING NA CIDADE {target_city}")
@@ -120,6 +121,7 @@ def finetune_model(
     ).to(device)
 
     model.load_state_dict(state, strict=True)
+    max_scheduled_p = max_scheduled_p or float(config.get('max_scheduled_p', 0.0))
     print(f"✅ Modelo pré-treinado carregado (val_loss_base: {ckpt.get('val_loss', 'N/A')})")
 
     
@@ -209,12 +211,14 @@ def finetune_model(
     stopper = EarlyStopper(patience=2, min_delta=1e-4, mode='min')
     
     # 5. Loop de fine-tuning
+    p_scheduled = 0.0
     for epoch in range(start_epoch, n_epochs):
         # === TREINO ===
         model.train()
         train_loss_epoch = 0.0
         train_count = 0
 
+        p_scheduled = max_scheduled_p * epoch / max(n_epochs - 1, 1) if n_epochs > 1 else 0.0
         print(f"\n🔄 Fine-tune Época {epoch+1}/{n_epochs} - Cidade {target_city}")
         train_pbar = tqdm(train_loader, desc=f'Finetune {target_city}')
 
@@ -230,18 +234,27 @@ def finetune_model(
 
                 optimizer.zero_grad(set_to_none=True)
 
-                pred = model.forward_single_step(uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq)
                 target = target_coords.squeeze(1)
+                input_seq = coords_seq
+                if p_scheduled > 0 and torch.rand(1).item() < p_scheduled and coords_seq.size(1) > 1:
+                    with torch.no_grad():
+                        pred_ctx = model.forward_single_step(
+                            uid, d_norm, t_sin, t_cos, city, poi_norm,
+                            coords_seq[:, :-1, :]
+                        )
+                    input_seq = coords_seq.clone()
+                    input_seq[:, -1, :] = pred_ctx.detach()
+
+                pred, logits = model.forward_single_step(
+                    uid, d_norm, t_sin, t_cos, city, poi_norm, input_seq,
+                    return_logits=True
+                )
 
                 if not torch.isfinite(pred).all():
                     continue
 
                 # Loss: CE sobre cluster + MSE auxiliar
                 target_cluster = find_nearest_cluster(target, model.destination_head.centers)
-                _, logits = model.forward_single_step(
-                    uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq,
-                    return_logits=True
-                )
                 loss_ce = F.cross_entropy(logits, target_cluster)
                 loss_mse = F.mse_loss(pred, target)
                 loss = loss_ce + loss_alpha * loss_mse
@@ -277,13 +290,12 @@ def finetune_model(
                     uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, target_coords = [
                         b.to(device) for b in batch
                     ]
-                    pred = model.forward_single_step(uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq)
-                    target = target_coords.squeeze(1)
-                    target_cluster_v = find_nearest_cluster(target, model.destination_head.centers)
-                    _, logits_v = model.forward_single_step(
+                    pred, logits_v = model.forward_single_step(
                         uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq,
                         return_logits=True
                     )
+                    target = target_coords.squeeze(1)
+                    target_cluster_v = find_nearest_cluster(target, model.destination_head.centers)
                     loss_ce_v = F.cross_entropy(logits_v, target_cluster_v)
                     loss_mse_v = F.mse_loss(pred, target)
                     vloss = loss_ce_v + loss_alpha * loss_mse_v
