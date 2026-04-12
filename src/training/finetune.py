@@ -438,6 +438,7 @@ def finetune_model(
 def sequential_finetuning(
     parquet_path: str,
     base_checkpoint: str,
+    resume_from_checkpoint: bool = True,
     cities: list[str] = ["B", "C", "D"],
     device: torch.device = None,
     n_epochs_per_city: int = 3,
@@ -489,6 +490,7 @@ def sequential_finetuning(
                 learning_rate=learning_rate,
                 sequence_length=sequence_length,
                 save_path=city_checkpoint,
+                resume_from_checkpoint=resume_from_checkpoint,
                 # MLflow - Passa tracker e base run ID
                 mlflow_tracker=mlflow_tracker,
                 base_run_id=base_run_id,

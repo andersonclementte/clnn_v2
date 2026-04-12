@@ -174,6 +174,7 @@ def run_from_yaml(cfg_path: str) -> None:
         learning_rate=ft_lr,
         sequence_length=seq_len,
         mlflow_tracker=tracker,
+        resume_from_checkpoint=resume_checkpoint,
     )
     # Se sequential_finetuning aceitar batch_size, passamos. Se não, ignoramos.
     if "batch_size" in inspect.signature(sequential_finetuning).parameters:
