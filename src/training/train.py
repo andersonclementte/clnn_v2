@@ -262,20 +262,23 @@ def train_humob_model(
 
     stopper = EarlyStopper(patience=3, min_delta=1e-4, mode='min')
 
-    latest = get_latest_checkpoint("outputs/models/checkpoints", "checkpoint_epoch_*.pt")
-    if latest:
-        try:
-            print(f"🔁 Tentando retomar de {latest}")
-            start_epoch, _ = load_training_checkpoint(model, optimizer, latest, map_location="cpu", strict=True,
-                                                    scheduler=scheduler if 'scheduler' in locals() else None)
-            print(f"✅ Checkpoint carregado: época {start_epoch}")
-        except RuntimeError as e:
-            print(f"⚠️  Checkpoint incompatível (arquitetura mudou): {e}")
-            print("🚀 Ignorando checkpoint e iniciando do zero.")
-            start_epoch = 0
+    start_epoch = 0
+    if resume_from_checkpoint:
+        latest = get_latest_checkpoint("outputs/models/checkpoints", "checkpoint_epoch_*.pt")
+        if latest:
+            try:
+                print(f"🔁 Tentando retomar de {latest}")
+                start_epoch, _ = load_training_checkpoint(model, optimizer, latest, map_location="cpu", strict=True,
+                                                        scheduler=scheduler if 'scheduler' in locals() else None)
+                print(f"✅ Checkpoint carregado: época {start_epoch}")
+            except RuntimeError as e:
+                print(f"⚠️  Checkpoint incompatível (arquitetura mudou): {e}")
+                print("🚀 Ignorando checkpoint e iniciando do zero.")
+                start_epoch = 0
+        else:
+            print("🚀 Nenhum checkpoint encontrado, iniciando do zero")
     else:
-        print("🚀 Nenhum checkpoint encontrado, iniciando do zero")
-        start_epoch = 0
+        print("🚀 resume_from_checkpoint=False — treinando do zero")
     
     p_scheduled = 0.0  # Fase 4: cresce ate max_scheduled_p ao longo das epocas
 
