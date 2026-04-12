@@ -29,6 +29,7 @@ training:
     n_epochs: 1
     learning_rate: 3e-4
     batch_size: 16
+    resume_from_checkpoint: false  # smoke sempre retreina do zero
     mixed_precision: true
   finetune:
     n_epochs: 1

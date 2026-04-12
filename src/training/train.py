@@ -190,6 +190,7 @@ def train_humob_model(
     fusion_dim: int = 8,
     loss_alpha: float = 0.1,
     max_sequences_per_user: int = 50,
+    max_scheduled_p: float = 0.0,
 ):
     """Treina o modelo HuMob com dados normalizados e tracking MLflow."""
     print("🏋️ Iniciando treinamento do modelo HuMob...")
@@ -276,7 +277,12 @@ def train_humob_model(
         print("🚀 Nenhum checkpoint encontrado, iniciando do zero")
         start_epoch = 0
     
+    p_scheduled = 0.0  # Fase 4: cresce ate max_scheduled_p ao longo das epocas
+
     for epoch in range(start_epoch, n_epochs):
+        # Fase 4: p_scheduled cresce linearmente de 0 ate max_scheduled_p
+        p_scheduled = max_scheduled_p * epoch / max(n_epochs - 1, 1) if n_epochs > 1 else 0.0
+
         # === TREINO ===
         model.train()
         train_loss_epoch = 0
@@ -285,7 +291,7 @@ def train_humob_model(
         # Inicializa variáveis que podem não ser definidas
         post_clip_norm = 0.0
         
-        print(f"\n🔄 Época {epoch+1}/{n_epochs}")
+        print(f"\n🔄 Época {epoch+1}/{n_epochs} | p_scheduled={p_scheduled:.2f}")
         train_pbar = tqdm(train_loader, desc=f'Treino {cities}')
         
         for batch_idx, batch in enumerate(train_pbar):
@@ -299,21 +305,35 @@ def train_humob_model(
                 
                 optimizer.zero_grad(set_to_none=True)
                 
-                # Forward
-                pred = model.forward_single_step(uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq)
                 target = target_coords.squeeze(1)
-                
+
+                # Fase 4: Scheduled Sampling
+                # Com prob. p_scheduled, substitui o ultimo passo de coords_seq
+                # pela predicao do modelo, simulando o rollout de avaliacao.
+                if p_scheduled > 0 and torch.rand(1).item() < p_scheduled and coords_seq.size(1) > 1:
+                    with torch.no_grad():
+                        pred_ctx = model.forward_single_step(
+                            uid, d_norm, t_sin, t_cos, city, poi_norm,
+                            coords_seq[:, :-1, :]  # prefixo sem o ultimo passo real
+                        )
+                    input_seq = coords_seq.clone()
+                    input_seq[:, -1, :] = pred_ctx.detach()
+                else:
+                    input_seq = coords_seq
+
+                # Forward unico retornando pred e logits (corrige double-pass anterior)
+                pred, logits = model.forward_single_step(
+                    uid, d_norm, t_sin, t_cos, city, poi_norm, input_seq,
+                    return_logits=True
+                )
+
                 # Verificação de predição
                 if not torch.isfinite(pred).all():
                     print("⚠️ Predição contém NaN/Inf, pulando batch")
                     continue
-                
+
                 # Loss: CE sobre cluster + MSE auxiliar
                 target_cluster = find_nearest_cluster(target, model.destination_head.centers)
-                _, logits = model.forward_single_step(
-                    uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq,
-                    return_logits=True
-                )
                 loss_ce = F.cross_entropy(logits, target_cluster)
                 loss_mse = F.mse_loss(pred, target)
                 loss = loss_ce + loss_alpha * loss_mse
@@ -421,6 +441,7 @@ def train_humob_model(
                     'poi_out_dim': poi_out_dim,
                     'lstm_hidden': lstm_hidden,
                     'fusion_dim': fusion_dim,
+                    'max_scheduled_p': max_scheduled_p,
                 },
                 'train_loss': float(avg_train_loss),
                 'mlflow_run_id': run_id
@@ -467,6 +488,7 @@ def train_humob_model(
                     'poi_out_dim': poi_out_dim,
                     'lstm_hidden': lstm_hidden,
                     'fusion_dim': fusion_dim,
+                    'max_scheduled_p': max_scheduled_p,
                 },
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
@@ -551,13 +573,19 @@ def evaluate_model(
         # fallback: checkpoint pode ser o próprio state_dict
         state = ckpt
 
-    # 2) Instancia modelo e carrega pesos
+    # 2) Instancia modelo e carrega pesos (lê arch params do config do checkpoint)
     model = HuMobModel(
         n_users=n_users,
         n_cities=n_cities,
         cluster_centers=centers,
         sequence_length=seq_len_eval,
         prediction_steps=1,
+        user_emb_dim=int(cfg.get('user_emb_dim', 4)),
+        city_emb_dim=int(cfg.get('city_emb_dim', 4)),
+        temporal_dim=int(cfg.get('temporal_dim', 8)),
+        poi_out_dim=int(cfg.get('poi_out_dim', 4)),
+        lstm_hidden=int(cfg.get('lstm_hidden', 4)),
+        fusion_dim=int(cfg.get('fusion_dim', 8)),
     ).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()
