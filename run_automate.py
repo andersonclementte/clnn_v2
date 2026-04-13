@@ -164,8 +164,6 @@ def run_from_yaml(cfg_path: str) -> None:
         max_train_batches=max_train_batches,
         max_val_batches=max_val_batches,
         resume_from_checkpoint=resume_checkpoint,
-        max_train_batches=max_train_batches,
-        max_val_batches=max_val_batches,
     )
     print(f"   ✅ Treino base concluído -> {base_ckpt.name}")
 
