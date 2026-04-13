@@ -11,31 +11,34 @@ model:
   n_clusters: 16
   n_users: 100000
   sequence_length: 12
-  max_users: 500             # limita usuarios unicos — torna smoke genuinamente rapido
-  max_sequences_per_user: 2   # sequencias por usuario
+  max_sequences_per_user: 50
   # Fase 1 — reparametrização
   user_emb_dim: 32
   city_emb_dim: 8
   temporal_dim: 16
   poi_out_dim: 16
-  lstm_hidden: 64     # bidirecional → 128-D de saída
+  lstm_hidden: 64
   fusion_dim: 128
   # Fase 2 — loss CE + MSE auxiliar
-  loss_alpha: 0.1     # peso do MSE (loss = CE + alpha * MSE)
+  loss_alpha: 0.1
   # Fase 4 — scheduled sampling
-  max_scheduled_p: 0.5   # prob. max de substituir último passo pelo pred do modelo
+  max_scheduled_p: 0.5
 
 training:
   base:
-    n_epochs: 1
+    n_epochs: 2               # >1 para que resume de epoch 1 ainda execute epoch 2
     learning_rate: 3e-4
-    batch_size: 16
-    resume_from_checkpoint: false  # smoke sempre retreina do zero
+    batch_size: 32
+    resume_from_checkpoint: true
+    max_train_batches: 20     # só 20 batches de treino — valida forward/backward/loss
+    max_val_batches: 5        # só 5 batches de val — valida loop de avaliação
     mixed_precision: true
   finetune:
     n_epochs: 1
     learning_rate: 5e-5
-    batch_size: 8
+    batch_size: 32
+    max_train_batches: 10
+    max_val_batches: 3
 
 hardware:
   device: "cuda"
@@ -44,7 +47,7 @@ hardware:
 
 eval:
   compare: true
-  n_samples: 200
+  n_samples: 50             # amostra pequena para comparação rápida
   pred_gt:
     enabled: false
 

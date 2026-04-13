@@ -55,6 +55,8 @@ def finetune_model(
     checkpoint_every_n_epochs: int = 1,
     loss_alpha: float = 0.1,
     max_scheduled_p: float = 0.0,
+    max_train_batches: int = 0,
+    max_val_batches: int = 0,
 ):
     """Fine-tuning do modelo pré-treinado em uma cidade específica."""
     print(f"🎯 FINE-TUNING NA CIDADE {target_city}")
@@ -274,7 +276,8 @@ def finetune_model(
                         'Loss': f'{loss.item():.5f}',
                         'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
                     })
-
+                if max_train_batches > 0 and batch_idx + 1 >= max_train_batches:
+                    break
             except Exception as e:
                 print(f"⚠️ Erro batch {batch_idx}: {e}")
                 continue
@@ -285,7 +288,7 @@ def finetune_model(
         val_count = 0
 
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc='Val'):
+            for val_batch_idx, batch in enumerate(tqdm(val_loader, desc='Val')):
                 try:
                     uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, target_coords = [
                         b.to(device) for b in batch
@@ -303,6 +306,8 @@ def finetune_model(
                     bs = target.size(0)
                     val_loss_epoch += float(vloss.item()) * bs
                     val_count += bs
+                    if max_val_batches > 0 and val_batch_idx + 1 >= max_val_batches:
+                        break
                 except Exception:
                     continue
 
@@ -439,6 +444,8 @@ def sequential_finetuning(
     parquet_path: str,
     base_checkpoint: str,
     resume_from_checkpoint: bool = True,
+    max_train_batches: int = 0,
+    max_val_batches: int = 0,
     cities: list[str] = ["B", "C", "D"],
     device: torch.device = None,
     n_epochs_per_city: int = 3,
@@ -491,6 +498,8 @@ def sequential_finetuning(
                 sequence_length=sequence_length,
                 save_path=city_checkpoint,
                 resume_from_checkpoint=resume_from_checkpoint,
+                max_train_batches=max_train_batches,
+                max_val_batches=max_val_batches,
                 # MLflow - Passa tracker e base run ID
                 mlflow_tracker=mlflow_tracker,
                 base_run_id=base_run_id,

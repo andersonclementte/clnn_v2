@@ -192,6 +192,8 @@ def train_humob_model(
     max_sequences_per_user: int = 50,
     max_scheduled_p: float = 0.0,
     max_users: int = 0,
+    max_train_batches: int = 0,
+    max_val_batches: int = 0,
 ):
     """Treina o modelo HuMob com dados normalizados e tracking MLflow."""
     print("🏋️ Iniciando treinamento do modelo HuMob...")
@@ -370,7 +372,8 @@ def train_humob_model(
                         'GradNorm': f'{post_clip_norm:.2f}',
                         'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
                     })
-                    
+                if max_train_batches > 0 and batch_idx + 1 >= max_train_batches:
+                    break
             except Exception as e:
                 print(f"❌ Erro no batch {batch_idx}: {e}")
                 continue
@@ -382,7 +385,7 @@ def train_humob_model(
         
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc='Val')
-            for batch in val_pbar:
+            for val_batch_idx, batch in enumerate(val_pbar):
                 try:
                     uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq, target_coords = [b.to(device) for b in batch]
                     
@@ -395,7 +398,8 @@ def train_humob_model(
                     val_count += target.size(0)
                     
                     val_pbar.set_postfix({'Val Loss': f'{loss.item():.4f}'})
-                    
+                    if max_val_batches > 0 and val_batch_idx + 1 >= max_val_batches:
+                        break
                 except Exception as e:
                     continue
         

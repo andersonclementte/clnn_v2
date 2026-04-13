@@ -96,6 +96,8 @@ def run_from_yaml(cfg_path: str) -> None:
     base_bs = int(base_cfg.get("batch_size", 16))
     base_mixed = bool(base_cfg.get("mixed_precision", True))
     resume_checkpoint = bool(base_cfg.get("resume_from_checkpoint", True))
+    max_train_batches = int(base_cfg.get("max_train_batches", 0))
+    max_val_batches = int(base_cfg.get("max_val_batches", 0))
 
     ft_epochs = int(ft_cfg.get("n_epochs", 1))
     ft_lr = float(ft_cfg.get("learning_rate", 5e-5))
@@ -159,7 +161,11 @@ def run_from_yaml(cfg_path: str) -> None:
         max_sequences_per_user=max_seq_per_user,
         max_scheduled_p=max_scheduled_p,
         max_users=max_users,
+        max_train_batches=max_train_batches,
+        max_val_batches=max_val_batches,
         resume_from_checkpoint=resume_checkpoint,
+        max_train_batches=max_train_batches,
+        max_val_batches=max_val_batches,
     )
     print(f"   ✅ Treino base concluído -> {base_ckpt.name}")
 
