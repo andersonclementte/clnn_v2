@@ -191,6 +191,7 @@ def train_humob_model(
     loss_alpha: float = 0.1,
     max_sequences_per_user: int = 50,
     max_scheduled_p: float = 0.0,
+    max_users: int = 0,
 ):
     """Treina o modelo HuMob com dados normalizados e tracking MLflow."""
     print("🏋️ Iniciando treinamento do modelo HuMob...")
@@ -221,7 +222,8 @@ def train_humob_model(
         cities=cities,
         batch_size=batch_size,
         sequence_length=sequence_length,
-        max_sequences_per_user=max_sequences_per_user
+        max_sequences_per_user=max_sequences_per_user,
+        max_users=max_users,
     )
     
     # 2. Instancia modelo

@@ -27,6 +27,7 @@ class HuMobNormalizedDataset(IterableDataset):
         prediction_steps: int = 1,
         chunk_size: int = 10_000,
         max_sequences_per_user: int = 50,
+        max_users: int = 0,  # 0 = sem limite; >0 = limita usuários únicos
         train_days: tuple = (0.0, 0.80),     # Normalizado [0,1]
         val_days: tuple = (0.78, 1.0),       # Overlap intencional para seq_len longo
         test_days: tuple = (0.78, 1.0)       # Para cidades B,C,D
@@ -39,6 +40,7 @@ class HuMobNormalizedDataset(IterableDataset):
         self.prediction_steps = prediction_steps
         self.chunk_size = chunk_size
         self.max_sequences_per_user = max_sequences_per_user
+        self.max_users = max_users
         
         # Define range de dias baseado no modo
         if mode == "train":
@@ -163,6 +165,7 @@ class HuMobNormalizedDataset(IterableDataset):
         prev_uids: set = set()      # uids vistos no chunk anterior
         total_rows_read = 0
         total_seqs = 0
+        users_yielded: set = set()  # rastreia usuários já gerados
 
         def _filter_chunk(table):
             """Aplica filtros de cidade e d_norm. Retorna DataFrame ou None."""
@@ -194,12 +197,16 @@ class HuMobNormalizedDataset(IterableDataset):
 
         def _yield_user(uid):
             """Gera sequências para uid e remove do spillover."""
+            if self.max_users > 0 and len(users_yielded) >= self.max_users:
+                spillover.pop(uid, None)
+                return
             dfs = spillover.pop(uid, None)
             if dfs is None:
                 return
             user_df = pd.concat(dfs).sort_values(['d_norm', 't_sin', 't_cos'])
             if len(user_df) < min_length:
                 return
+            users_yielded.add(uid)
             for seq in self._sample_user_sequences(user_df, self.max_sequences_per_user):
                 yield (
                     torch.tensor(seq['uid'], dtype=torch.long),
@@ -227,6 +234,10 @@ class HuMobNormalizedDataset(IterableDataset):
             for uid in prev_uids - cur_uids:
                 yield from _yield_user(uid)
 
+            # Para cedo se já atingiu max_users
+            if self.max_users > 0 and len(users_yielded) >= self.max_users:
+                break
+
             # Acumula dados do chunk atual no spillover
             for uid, grp in df.groupby('uid'):
                 spillover.setdefault(uid, []).append(grp)
@@ -248,6 +259,7 @@ def create_humob_loaders(
     cities: list[str] = ["A"],
     batch_size: int = 32,
     sequence_length: int = 24,
+    max_users: int = 0,
     max_sequences_per_user: int = 50,
     num_workers: int = 0
 ):
@@ -258,7 +270,8 @@ def create_humob_loaders(
         cities=cities,
         mode="train",
         sequence_length=sequence_length,
-        max_sequences_per_user=max_sequences_per_user
+        max_sequences_per_user=max_sequences_per_user,
+        max_users=max_users,
     )
     
     val_ds = HuMobNormalizedDataset(
@@ -266,7 +279,8 @@ def create_humob_loaders(
         cities=cities,
         mode="val", 
         sequence_length=sequence_length,
-        max_sequences_per_user=max_sequences_per_user // 2
+        max_sequences_per_user=max_sequences_per_user // 2,
+        max_users=max_users,
     )
     
     train_loader = DataLoader(

@@ -11,7 +11,8 @@ model:
   n_clusters: 16
   n_users: 100000
   sequence_length: 12
-  max_sequences_per_user: 2   # limita sequencias por usuario — mantém smoke rápido
+  max_users: 500             # limita usuarios unicos — torna smoke genuinamente rapido
+  max_sequences_per_user: 2   # sequencias por usuario
   # Fase 1 — reparametrização
   user_emb_dim: 32
   city_emb_dim: 8

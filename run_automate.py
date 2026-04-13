@@ -86,6 +86,7 @@ def run_from_yaml(cfg_path: str) -> None:
     loss_alpha = float(_get(cfg, "model.loss_alpha", 0.1))
     max_seq_per_user = int(_get(cfg, "model.max_sequences_per_user", 50))
     max_scheduled_p = float(_get(cfg, "model.max_scheduled_p", 0.0))
+    max_users = int(_get(cfg, "model.max_users", 0))
 
     base_cfg = _get(cfg, "training.base", {}) or {}
     ft_cfg = _get(cfg, "training.finetune", {}) or {}
@@ -157,6 +158,7 @@ def run_from_yaml(cfg_path: str) -> None:
         loss_alpha=loss_alpha,
         max_sequences_per_user=max_seq_per_user,
         max_scheduled_p=max_scheduled_p,
+        max_users=max_users,
         resume_from_checkpoint=resume_checkpoint,
     )
     print(f"   ✅ Treino base concluído -> {base_ckpt.name}")
