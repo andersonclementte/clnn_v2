@@ -275,6 +275,10 @@ def train_humob_model(
                 start_epoch, _ = load_training_checkpoint(model, optimizer, latest, map_location="cpu", strict=True,
                                                         scheduler=scheduler if 'scheduler' in locals() else None)
                 print(f"✅ Checkpoint carregado: época {start_epoch}")
+                # Override lr do YAML (ignora lr salvo no checkpoint)
+                for pg in optimizer.param_groups:
+                    pg['lr'] = learning_rate
+                print(f"🔧 LR forçado para {learning_rate} (do config)")
             except RuntimeError as e:
                 print(f"⚠️  Checkpoint incompatível (arquitetura mudou): {e}")
                 print("🚀 Ignorando checkpoint e iniciando do zero.")
