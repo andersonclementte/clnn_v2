@@ -1,27 +1,39 @@
-experiment_name: humob2
+experiment_name: humob_v2_full
 logging:
   tracking_uri: "file:./mlruns"
 
-
 data:
   parquet_file: "humob_all_cities_v2_normalized.parquet"
-  processed_data_path: "data/processed/"
+  base_city: "A"
+  finetune_cities: ["B", "C", "D"]
 
 model:
   n_clusters: 512
   n_users: 100000
   sequence_length: 720
+  # Fase 1 — reparametrização
+  user_emb_dim: 32
+  city_emb_dim: 8
+  temporal_dim: 16
+  poi_out_dim: 16
+  lstm_hidden: 64       # bidirecional → 128-D de saída
+  fusion_dim: 128
+  # Fase 2 — loss CE + MSE auxiliar
+  loss_alpha: 0.1
+  # Fase 4 — scheduled sampling
+  max_scheduled_p: 0.5
 
 training:
   base:
     n_epochs: 8
     learning_rate: 3e-4
-    batch_size: 64          # seguro p/ A4000 em seq_len=720
+    batch_size: 64
+    resume_from_checkpoint: true
     mixed_precision: true
   finetune:
     n_epochs: 5
     learning_rate: 5e-5
-    batch_size: 16          # FT costuma precisar um pouco menos
+    batch_size: 16
 
 hardware:
   device: "cuda"
@@ -30,18 +42,21 @@ hardware:
 
 eval:
   compare: true
+  n_samples: 2000
   pred_gt:
-    enabled: true                  # 👈 liga a geração do Parquet Pred+GT
-    split: "val"                   # use "val" (garante GT). "test" só se seu dataset expor GT
-    day_range: [61, 75]            # opcional; em "val" pode ser omitido
+    enabled: true
+    split: "val"
+    day_range: [61, 75]
     batch_size: 2048
-    target_cities: ["B","C","D"]
+    target_cities: ["B", "C", "D"]
 
-do_submit: false
-target_submit_cities: ["B", "C", "D"]
-submission_days: [61, 75]
+submission:
+  enabled: false
+  days: [61, 75]
+  target_cities: ["B", "C", "D"]
 
 outputs:
   models_path: "outputs/models/"
   submissions_path: "outputs/submissions/"
   plots_path: "outputs/plots/"
+  eval_path: "outputs/eval/"
