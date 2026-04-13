@@ -8,7 +8,7 @@ data:
   finetune_cities: ["B", "C", "D"]
 
 model:
-  max_sequences_per_user: 10
+  max_sequences_per_user: 20
   n_clusters: 512
   n_users: 100000
   sequence_length: 720
