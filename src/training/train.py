@@ -354,7 +354,7 @@ def train_humob_model(
                 
                 # Gradient clipping
                 pre_clip_norm = grad_norm(model)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
                 post_clip_norm = grad_norm(model)
                 
                 if pre_clip_norm > 10:
