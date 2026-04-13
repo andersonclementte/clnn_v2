@@ -12,28 +12,28 @@ model:
   n_users: 100000
   sequence_length: 720
   # Fase 1 — reparametrização
-  user_emb_dim: 32
-  city_emb_dim: 8
-  temporal_dim: 16
-  poi_out_dim: 16
-  lstm_hidden: 64       # bidirecional → 128-D de saída
-  fusion_dim: 128
+  user_emb_dim: 64
+  city_emb_dim: 16
+  temporal_dim: 32
+  poi_out_dim: 32
+  lstm_hidden: 128      # bidirecional → 256-D de saída
+  fusion_dim: 256
   # Fase 2 — loss CE + MSE auxiliar
   loss_alpha: 0.1
   # Fase 4 — scheduled sampling
-  max_scheduled_p: 0.5
+  max_scheduled_p: 0.7
 
 training:
   base:
-    n_epochs: 8
+    n_epochs: 20
     learning_rate: 1e-4
     batch_size: 64
     resume_from_checkpoint: true
     mixed_precision: true
   finetune:
-    n_epochs: 5
+    n_epochs: 8
     learning_rate: 5e-5
-    batch_size: 16
+    batch_size: 32
 
 hardware:
   device: "cuda"
