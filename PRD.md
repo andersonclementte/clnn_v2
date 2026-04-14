@@ -1,6 +1,6 @@
 # PRD — CLNN v2: Human Mobility Prediction
 
-> **Última atualização:** 2026-04-10
+> **Última atualização:** 2026-04-14
 > **Contexto:** Este documento consolida todo o conhecimento adquirido até abril de 2026, incluindo bugs corrigidos, resultados reais com métricas oficiais, diagnóstico do modelo atual e plano de implementação para as próximas melhorias. Escrito para que qualquer LLM ou desenvolvedor possa retomar o trabalho sem perda de contexto.
 
 ---
@@ -466,3 +466,85 @@ clnn_v2/
 | Hardware | NVIDIA RTX A4000 (16 GB VRAM) |
 | OS servidor | Linux (domínio `orion.net`, UFAL) |
 | Métricas oficiais | geobleu (Yahoo Japan) + fastdtw |
+
+---
+
+## 12. Diagnóstico de Arquitetura — Sessão 2026-04-14
+
+### 12.1 Bugs Corrigidos no Val Loop
+
+**Bug:** `criterion` não estava definido no escopo de `train_humob_model`.
+
+O val loop chamava `criterion(pred, target)`, mas `criterion = nn.MSELoss()` só existe dentro de `evaluate_model`. Em cada batch de val, um `NameError` era lançado silenciosamente pelo `except Exception: continue`, deixando `val_count=0` e `val_loss=0.0` para sempre. O early stopping era ativado incorretamente após 3 épocas com val_loss=0.
+
+**Correção:** substituído por `F.mse_loss(pred, target)` direto no val loop (`train.py:399`).
+
+---
+
+### 12.2 Problemas de Arquitetura Identificados e Corrigidos
+
+**1. Attention collapse com seq_len longo** (`partial_info.py`)
+
+Softmax sobre 720 timesteps sem temperatura colapsa para 1-2 posições (winner-takes-all). Equivalente a usar só o último hidden state, anulando o benefício do attention pooling.
+
+**Correção:** dividir scores por `√output_dim` antes do softmax (scaled dot-product attention).
+
+```python
+scale = self.output_dim ** 0.5
+scores = self.attention(output).squeeze(-1) / scale
+```
+
+**2. LSTM output sem normalização** (`humob_model.py`)
+
+`static_red` passa por LayerNorm em `ExternalInformationDense`, mas `dyn_emb` (LSTM output) chegava cru ao `WeightedFusion`. Com magnitudes divergentes e pesos escalares fixos (w_r, w_e), um dos sinais dominava completamente.
+
+**Correção:** `nn.LayerNorm(lstm_hidden * 2)` aplicado ao output do LSTM antes da fusão.
+
+**3. ReLU matando capacidade em features numéricas** (`external_info.py`)
+
+`d_norm ∈ [0,1]` com Xavier init produz 50% dos neurônios zerados por ReLU desde o início. Mesmo problema em `time_proj`, `poi_proj` e `ExternalInformationDense`.
+
+**Correção:** substituído ReLU por GELU em todas essas projeções. GELU não zera gradiente para entradas negativas e tem comportamento mais suave.
+
+---
+
+### 12.3 Análise dos 512 Clusters KMeans (centers_A_512.npy)
+
+- **Cobertura:** X ∈ [0.003, 0.99], Y ∈ [0.006, 0.99] — cobre todo o grid ✅
+- **Distribuição:** mean (0.60, 0.44) — centro urbano deslocado para direita, padrão realista
+- **Redundância:** dist_min=0.012, p05=0.103 → ~5% dos clusters estão a <20 pixels de distância, efectivamente duplicados
+- **Impacto:** ~25 dos 512 clusters são redundantes → CE loss com ruído residual estrutural
+- **Ação:** tolerar por agora; considerar reduzir para 256 se loss estagnar acima de 3.0
+
+---
+
+### 12.4 Inconsistências Config vs. Dataset (descobertas em 2026-04-14)
+
+| Parâmetro | Valor anterior | Valor correto | Motivo |
+|-----------|---------------|---------------|--------|
+| `sequence_length` | 720 (15 dias) | **336** (7 dias) | seq=720 exige 721 pontos contíguos; média é 1115/user em A, <100 em D → maioria dos users de D era descartada |
+| `max_scheduled_p` | 0.7 | **0.3** | 70% de substituição na fase inicial = modelo aprende sobre seu próprio ruído; 30% é mais seguro |
+| `learning_rate` | 3e-5 | **1e-4** | Reduzido por explosões antes dos fixes de arquitetura; com LayerNorm + attention temperature, 1e-4 é estável |
+
+**Impacto do sequence_length:**
+- City A: 111.5M rows / 100k users ≈ 1.115 pts/user → ambos os tamanhos viáveis
+- City D: 7.6M rows / ~6k users ≈ 76 pts/user → seq=720 descarta quase todos; seq=336 ainda exige 337 pts (crítico para D)
+- Cobertura de usuários esperada: significativamente maior com seq=336
+
+---
+
+### 12.5 Estado Pós-Correções (2026-04-14)
+
+| Item | Status |
+|------|--------|
+| Fases 1–4 implementadas | ✅ Completo |
+| Bug val `criterion` undefined | ✅ Corrigido |
+| Attention temperature | ✅ Aplicado |
+| LayerNorm no LSTM output | ✅ Aplicado |
+| ReLU → GELU | ✅ Aplicado |
+| Config sequence_length 720→336 | ✅ Aplicado |
+| Config max_scheduled_p 0.7→0.3 | ✅ Aplicado |
+| Config lr 3e-5→1e-4 | ✅ Aplicado |
+| Checkpoints incompatíveis descartados | ✅ Feito |
+| Treino v2 corrigido iniciado | ⏳ Aguardando início |
+| Fase 5 (Transformer) | 🔵 Próxima fase |

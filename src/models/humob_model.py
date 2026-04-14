@@ -110,6 +110,7 @@ class HuMobModel(nn.Module):
             hidden_size=lstm_hidden,
             bidirectional=True
         )
+        self.lstm_norm = nn.LayerNorm(lstm_hidden * 2)
         self.weighted_fusion = WeightedFusion(dim=fusion_dim)
         self.destination_head = DestinationHead(
             in_dim=fusion_dim,
@@ -126,7 +127,7 @@ class HuMobModel(nn.Module):
         """
         static_emb = self.fusion(uid, d_norm, t_sin, t_cos, city, poi_norm)
         static_red = self.dense(static_emb)
-        dyn_emb = self.lstm(coords_seq)
+        dyn_emb = self.lstm_norm(self.lstm(coords_seq))
         fused = self.weighted_fusion(static_red, dyn_emb)
         return self.destination_head(fused, return_logits=return_logits)
 

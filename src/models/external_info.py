@@ -82,17 +82,17 @@ class ExternalInformationFusionNormalized(nn.Module):
         
         # Projeções temporais
         d_input = d_norm.unsqueeze(1)  # (B, 1)
-        e_day = F.relu(self.day_proj(d_input))  # (B, temporal_dim)
+        e_day = F.gelu(self.day_proj(d_input))  # (B, temporal_dim)
         
         t_input = torch.stack([t_sin, t_cos], dim=1)  # (B, 2)
-        e_time = F.relu(self.time_proj(t_input))      # (B, temporal_dim)
+        e_time = F.gelu(self.time_proj(t_input))      # (B, temporal_dim)
         
         # Projeção POI (com opção de desabilitar para debug)
         if self.disable_poi:
             e_poi = torch.zeros(batch_size, self.poi_proj.out_features,
                                device=poi_norm.device, dtype=poi_norm.dtype)
         else:
-            e_poi = F.relu(self.poi_proj(poi_norm))   # (B, poi_out_dim)
+            e_poi = F.gelu(self.poi_proj(poi_norm))   # (B, poi_out_dim)
         
         # Concatena tudo
         fused = torch.cat([e_uid, e_city, e_day, e_time, e_poi], dim=-1)
@@ -123,7 +123,7 @@ class ExternalInformationDense(nn.Module):
         """
         x = self.layer_norm(x)
         x = self.dropout(x)
-        return F.relu(self.fc(x))
+        return F.gelu(self.fc(x))
 
 
 # FUNÇÕES DE UTILIDADE PARA DEBUG

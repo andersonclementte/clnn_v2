@@ -11,7 +11,7 @@ model:
   max_sequences_per_user: 20
   n_clusters: 512
   n_users: 100000
-  sequence_length: 720
+  sequence_length: 336
   # Fase 1 — reparametrização
   user_emb_dim: 64
   city_emb_dim: 16
@@ -22,14 +22,14 @@ model:
   # Fase 2 — loss CE + MSE auxiliar
   loss_alpha: 0.1
   # Fase 4 — scheduled sampling
-  max_scheduled_p: 0.7
+  max_scheduled_p: 0.3
 
 training:
   base:
     n_epochs: 20
-    learning_rate: 3e-5
+    learning_rate: 1e-4
     batch_size: 64
-    resume_from_checkpoint: true
+    resume_from_checkpoint: false
     max_val_batches: 200
     mixed_precision: true
   finetune:

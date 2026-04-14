@@ -396,7 +396,7 @@ def train_humob_model(
                     pred = model.forward_single_step(uid, d_norm, t_sin, t_cos, city, poi_norm, coords_seq)
                     target = target_coords.squeeze(1)
                     
-                    loss = criterion(pred, target)
+                    loss = F.mse_loss(pred, target)
                     
                     val_loss_epoch += loss.item() * target.size(0)
                     val_count += target.size(0)
@@ -405,6 +405,10 @@ def train_humob_model(
                     if max_val_batches > 0 and val_batch_idx + 1 >= max_val_batches:
                         break
                 except Exception as e:
+                    if val_batch_idx == 0:
+                        import traceback
+                        print(f'⚠️ [val] Exceção no batch 0: {type(e).__name__}: {e}')
+                        traceback.print_exc()
                     continue
         
         # Médias

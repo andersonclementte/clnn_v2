@@ -56,9 +56,10 @@ class CoordLSTM(nn.Module):
         # output: (batch, seq_len, hidden_size * num_directions)
         output, _ = self.lstm(x)
 
-        # Scores de atenção: (batch, seq_len, 1) → (batch, seq_len)
-        scores = self.attention(output).squeeze(-1)
-        weights = F.softmax(scores, dim=1)          # (batch, seq_len)
+        # Scores de atenção com temperatura (evita collapse em seq longas)
+        scale = self.output_dim ** 0.5
+        scores = self.attention(output).squeeze(-1) / scale  # (batch, seq_len)
+        weights = F.softmax(scores, dim=1)
 
         # Vetor de contexto: média ponderada dos hidden states
         context = (weights.unsqueeze(-1) * output).sum(dim=1)  # (batch, output_dim)
