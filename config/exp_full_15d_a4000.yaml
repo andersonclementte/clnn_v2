@@ -30,6 +30,7 @@ training:
     learning_rate: 3e-5
     batch_size: 64
     resume_from_checkpoint: true
+    max_val_batches: 200
     mixed_precision: true
   finetune:
     n_epochs: 8
