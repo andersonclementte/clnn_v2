@@ -411,7 +411,10 @@ def train_humob_model(
         avg_train_loss = train_loss_epoch / max(train_count, 1)
         avg_val_loss = val_loss_epoch / max(val_count, 1)
 
-        stopper.update(avg_val_loss)
+        if val_count == 0:
+            print("⚠️ Val sem dados válidos (val_days muito curto para seq_len). Early stopping desativado.")
+        else:
+            stopper.update(avg_val_loss)
         if stopper.should_stop:
             print(f"⏹️ Early stopping: sem melhoria por {stopper.patience} épocas. Melhor val_loss={stopper.best:.4f}")
             break

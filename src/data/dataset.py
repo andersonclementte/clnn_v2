@@ -29,7 +29,7 @@ class HuMobNormalizedDataset(IterableDataset):
         max_sequences_per_user: int = 50,
         max_users: int = 0,  # 0 = sem limite; >0 = limita usuários únicos
         train_days: tuple = (0.0, 0.80),     # Normalizado [0,1]
-        val_days: tuple = (0.78, 1.0),       # Overlap intencional para seq_len longo
+        val_days: tuple = (0.50, 1.0),       # >= 0.50 garante 30 dias disponíveis para seq_len=720
         test_days: tuple = (0.78, 1.0)       # Para cidades B,C,D
     ):
         self.parquet_path = parquet_path
@@ -261,7 +261,9 @@ def create_humob_loaders(
     sequence_length: int = 24,
     max_users: int = 0,
     max_sequences_per_user: int = 50,
-    num_workers: int = 0
+    num_workers: int = 0,
+    train_days: tuple = (0.0, 0.80),
+    val_days: tuple = (0.50, 1.0),
 ):
     """Cria loaders de treino e validação."""
     
@@ -272,6 +274,8 @@ def create_humob_loaders(
         sequence_length=sequence_length,
         max_sequences_per_user=max_sequences_per_user,
         max_users=max_users,
+        train_days=train_days,
+        val_days=val_days,
     )
     
     val_ds = HuMobNormalizedDataset(
@@ -281,6 +285,8 @@ def create_humob_loaders(
         sequence_length=sequence_length,
         max_sequences_per_user=max_sequences_per_user // 2,
         max_users=max_users,
+        train_days=train_days,
+        val_days=val_days,
     )
     
     train_loader = DataLoader(
