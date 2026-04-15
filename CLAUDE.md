@@ -1,108 +1,93 @@
 # CLAUDE.md — clnn_v2
 
-Contexto essencial para novas sessões de trabalho neste projeto.
+Contexto rápido para novas sessões. **Leia `PRD.md` antes de qualquer mudança significativa.**
 
-## O que é este projeto
+## O projeto
 
-Modelo de predição de mobilidade humana para o **HuMob Challenge 2024** (Yahoo Japan / SIGSPATIAL). Prediz a localização (x, y) de usuários em uma grade 200×200 a cada 30 minutos, para os dias 61–75 com base nos dias 1–60. Dataset: cidades A, B, C, D (~4.5 GB parquet). Objetivo: publicar artigo com resultados comparáveis ao top do challenge.
+Predição de mobilidade humana para o HuMob Challenge 2024. Prevê (x, y) em grade 200×200 a cada 30 min para os dias 61–75. Cidades A (treino), B/C/D (fine-tuning). Objetivo: publicar artigo comparável ao top do challenge (GEO-BLEU 0.319, DTW 27.15).
 
-**Leia o PRD.md completo** antes de qualquer trabalho — ele contém histórico de bugs corrigidos, resultados reais, diagnóstico do modelo atual e o plano de implementação v2.
-
-## Acesso ao servidor de treino
+## Servidor e execução
 
 ```bash
-# Já conectado à VPN (192.168.222.0/24)
-ssh anderson.clemente@192.168.222.252   # senha: &J!^o&4#$WSKX!
-
-# Projeto
+ssh anderson.clemente@192.168.222.252     # VPN necessária; senha: &J!^o&4#$WSKX!
 cd ~/clnn_v2
 
-# Rodar experimento
-sudo docker run --rm --gpus all \
+# Treino — Docker SEM sudo (usuário está no grupo docker)
+docker run --rm --gpus all \
   -e PYTHONPATH=/workspace \
   -v "$PWD:/workspace" humob:cu128 \
   python /workspace/run_automate.py --config /workspace/config/exp_full_15d_a4000.yaml
 ```
 
-- **GPU:** NVIDIA RTX A4000 (16 GB VRAM)
-- **Anderson NÃO tem sudo** no servidor (equipamento compartilhado da UFAL)
-- Não mexer em `/datastore/docker` nem em drivers de vídeo
-- Docker image `humob:cu128` já construída (~9.2 GB) — não rebuildar sem necessidade
-- Docker precisa de sudo; sem sudo, omitir `--gpus all` funciona para testes sem GPU
+- GPU: NVIDIA RTX A4000 (16 GB)
+- Anderson **NÃO tem sudo** — nunca sugerir `sudo`
+- Docker image `humob:cu128` já construída
+- **Nunca executar experimentos via SSH durante a sessão** — usuário roda em seu próprio tmux
 
-## Estado atual do modelo (v2 — aguardando início, 2026-04-14)
+## Estado atual (2026-04-15)
 
-### Fases implementadas
-| Fase | Descrição | Status |
-|------|-----------|--------|
-| 1 | Reparametrização (lstm_hidden=128, user_emb_dim=64, fusion_dim=256) | ✅ |
-| 2 | Loss CE + MSE auxiliar (CE sobre clusters KMeans, alpha=0.1) | ✅ |
-| 3 | Attention pooling sobre todos os LSTM outputs | ✅ |
-| 4 | Scheduled sampling (max_p=0.3, ramp linear) | ✅ |
-| 5 | Transformer Encoder substituindo BiLSTM | 🔵 Próxima |
+### Fases
+| Fase | Status |
+|------|--------|
+| 1 Reparametrização (lstm_hidden=128, fusion_dim=256) | ✅ |
+| 2 Loss CE + MSE auxiliar | ✅ |
+| 3 Attention pooling | ✅ |
+| 4 Scheduled sampling (ramp 0 → 0.3) | ✅ |
+| **5 Substituir BiLSTM por Transformer** | 🔵 Próxima — plano no PRD |
+| 6 Cobertura de usuários em C/D | 🔵 Futuro |
 
-### Correções de arquitetura aplicadas (2026-04-14)
-| Problema | Arquivo | Correção |
-|----------|---------|----------|
-| Attention collapse (seq longa sem temperatura) | partial_info.py | scores /= sqrt(output_dim) |
-| LSTM output sem normalização | humob_model.py | LayerNorm(lstm_hidden*2) antes do WeightedFusion |
-| ReLU zerando 50% das features temporais/POI | external_info.py | ReLU -> GELU em todas projeções |
-| Val loop: criterion não definido no escopo | train.py | criterion(pred,target) -> F.mse_loss(pred,target) |
+### Última execução (epoch 1 v2)
+- Train loss (CE+MSE): **4.12** | Val loss (MSE): **0.0071**
+- Tempo: ~9h/epoch | ~24.5k batches
+- **Problema ativo:** gradientes continuam explodindo (pre=11–59, clip=2.0) — causa estrutural do BPTT em LSTM. Fase 5 resolve.
 
-### Baseline v1 (para comparação)
-| Métrica | Cidade B | Cidade C | Cidade D | Top HuMob 2024 |
-|---------|---------|---------|---------|---------------|
-| GEO-BLEU | 0.1017 | 0.0276 | 0.1076 | 0.319 |
-| DTW | 174.70 | 236.92 | 156.91 | 27.15 |
+## Invariantes arquiteturais (não quebrar)
 
-## Config de produção atual (exp_full_15d_a4000.yaml)
+- `fusion_dim == lstm_hidden * 2` — `WeightedFusion` tem assert que quebra em runtime
+- `poi_proj = Linear(85, poi_out_dim)` — POI_norm é array 85-D (coluna `object`)
+- `n_users >= max(uid)+1` — uids vão até 99999 em todas as cidades
+- `tracking_uri: file:/tmp/mlruns` em smoke (permissões do container)
 
-Parâmetros relevantes para entender decisões:
+## Config de produção (`exp_full_15d_a4000.yaml`)
+
+Decisões não óbvias:
 
 ```yaml
-sequence_length: 336     # 7 dias — seq=720 descartava maioria dos users de C/D
-max_scheduled_p: 0.3     # 0.7 era agressivo demais para treino do zero
-learning_rate: 1e-4      # 3e-5 era conservador demais pos-fixes de arquitetura
-lstm_hidden: 128         # BiLSTM -> 256-D output == fusion_dim (DEVE ser igual)
-fusion_dim: 256          # WeightedFusion exige lstm_hidden*2 == fusion_dim
-n_clusters: 512          # KMeans; ~25 clusters redundantes (dist<0.01), toleravel
-max_val_batches: 200     # val em ~4 min; full val so no evaluate_model final
-resume_from_checkpoint: false  # checkpoints antigos sao incompativeis com v2
+sequence_length: 336     # 7 dias — seq=720 descartava maioria dos users de D
+max_scheduled_p: 0.3     # 0.7 era agressivo treinando do zero
+learning_rate: 1e-4      # 3e-5 era conservador pós-fixes de arquitetura
+lstm_hidden: 128         # → BiLSTM 256-D == fusion_dim (DEVE bater)
+n_clusters: 512          # KMeans; ~25 clusters redundantes, tolerável
+max_val_batches: 200     # val em ~4 min
 ```
 
-## Invariantes críticos da arquitetura
+## Permissões (gotchas Docker)
 
-- **fusion_dim DEVE ser igual a lstm_hidden * 2** — WeightedFusion tem assert que quebra caso contrário
-- **poi_proj = Linear(85, poi_out_dim)** — dataset tem POI_norm de 85 dimensões (array dentro de coluna object)
-- **n_users deve ser >= max(uid)+1** — uids vão de 0 a 99999 em todas as cidades
-- **/74.0 no rollout** — d_orig vai de 0 a 74 (75 dias), normalização correta
-- **tracking_uri em smoke:** usar file:/tmp/mlruns (container write-only em /tmp)
-
-## Bugs críticos conhecidos (não corrigidos)
-
-- **BPTT estrutural:** seq_len=336 ainda faz backprop por 336 passos em LSTM. Gradient clip em ~2.0 ainda vai disparar na maioria dos batches. Solução real: Transformer (Fase 5).
-- **Cobertura em City D:** 7.6M rows / ~6k users ≈ 76 pts/user. seq_len=336 exige 337 pontos contíguos → ainda filtra parte dos users de D. Monitorar cobertura no evaluate_model.
+- Container roda como `laccan` (UID 1000), host como `anderson.clemente` (UID diferente)
+- Arquivos criados no host precisam `chmod o+w` para o container sobrescrever
+- `outputs/models/humob_model_A.pt` é o arquivo final salvo — se já existe, precisa permissão `o+w`
+- `mlruns/` em 757 funciona
 
 ## Arquivos principais
 
 | Arquivo | Função |
 |---------|--------|
-| PRD.md | Documentação completa — leia primeiro |
-| run_automate.py | Pipeline principal (YAML -> KMeans -> treino -> FT -> avaliacao) |
-| evaluate_metrics.py | Calcula GEO-BLEU e DTW sobre pred_gt_all_users.parquet |
-| src/models/humob_model.py | HuMobModel — arquitetura principal |
-| src/models/partial_info.py | CoordLSTM — BiLSTM com attention pooling + temperatura |
-| src/models/external_info.py | ExternalInformationFusionNormalized — embeddings + GELU |
-| src/training/train.py | Loop de treino com CE+MSE loss, val com F.mse_loss |
-| src/training/finetune.py | Fine-tuning sequencial B->C->D |
-| config/exp_full_15d_a4000.yaml | Config de producao |
-| config/smoke_v2.yaml | Config de teste rapido com checkpoints |
+| `PRD.md` | ★ Documentação completa — leia primeiro |
+| `run_automate.py` | Pipeline: YAML → KMeans → treino → FT → avaliação |
+| `evaluate_metrics.py` | GEO-BLEU + DTW oficiais |
+| `src/models/humob_model.py` | `HuMobModel` (escolhe encoder via config) |
+| `src/models/partial_info.py` | `CoordLSTM` com attention pooling + temperatura |
+| `src/models/external_info.py` | Embeddings + projeções GELU |
+| `src/training/train.py` | `train_humob_model` (CE+MSE, val F.mse_loss) |
+| `src/training/finetune.py` | Fine-tuning sequencial B→C→D |
+| `config/exp_full_15d_a4000.yaml` | ★ Config de produção |
+| `config/smoke_v2.yaml` | Smoke test (2 epochs, max_batches) |
 
-## Convenções do projeto
+## Convenções
 
-- **Sempre rodar via Docker** — nunca instalar dependências direto no servidor
-- **Tracking via MLflow** local (file:./mlruns) — acessível em mlruns/
-- **Checkpoints** em outputs/models/checkpoints/ — mantém os 3 últimos
-- **Dados normalizados** em [0,1] — não desnormalizar antes do modelo
-- **Coordenadas discretas** via discretize_coordinates() — grade 0-199
-- **Branch única:** main — trabalho novo em feature branches, merge ao concluir
+- Docker para tudo — nunca instalar deps no host
+- MLflow local em `file:./mlruns`
+- Checkpoints em `outputs/models/checkpoints/` (últimos 3)
+- Dados em [0,1] — não desnormalizar
+- `discretize_coordinates()` para converter predição em célula 0–199
+- Branch única `main`; feature branches → merge ao concluir
