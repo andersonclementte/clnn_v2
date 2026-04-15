@@ -1,7 +1,7 @@
 # PRD — CLNN v2: Human Mobility Prediction
 
 > **Última atualização:** 2026-04-15
-> **Status:** v2 (BiLSTM + CE loss + Attention pooling) rodou com sucesso na epoch 1. Migração para Transformer (Fase 5) em planejamento.
+> **Status:** v2 BiLSTM em treino (epoch 2, City A). Transformer Encoder implementado na branch `feature/transformer-encoder`, aguardando conclusão do baseline BiLSTM para comparação.
 
 ---
 
@@ -35,27 +35,34 @@ Predição de mobilidade humana para o **HuMob Challenge 2024** (Yahoo Japan / S
 
 ## 2. Arquitetura Atual (v2)
 
+O modelo suporta **dois encoders intercambiáveis** via `encoder_type` no YAML. O resto do pipeline (external info, WeightedFusion, destination head) é idêntico — condição necessária para comparação justa.
+
 ```
-External Information                  Partial Information (BiLSTM)
-────────────────────                  ─────────────────────────────
+External Information                  Partial Information (encoder configurável)
+────────────────────                  ─────────────────────────────────────────
 User Emb (64-D)      ─┐               Coord Sequence (T × 2)
 City Emb (16-D)      ─┤                        ↓
-Day Proj (32-D GELU) ─┼─ Concat ─► Dense(256)  BiLSTM(hidden=128)
-Time Proj (32-D GELU)─┤                        ↓ (T × 256)
-POI Proj (32-D GELU) ─┘                 Attention Pooling
-                                        (temperature = √256)
-                                                ↓
-                                           LayerNorm(256)
-       │                                        │
-       └──────────────── WeightedFusion ────────┘
-                    (w_r · static + w_e · dynamic)
-                               ↓
-                       Destination Head
-            MLP(256 → 1024 → 512 logits) ─► softmax
-                               ↓
-                   Σ(p_k · cluster_centers_k)
-                               ↓
-                     Predicted (x, y) ∈ [0,1]²
+Day Proj (32-D GELU) ─┼─ Concat ─►    ┌────────┴────────┐
+Time Proj (32-D GELU)─┤               │                 │
+POI Proj (32-D GELU) ─┘          CoordLSTM       CoordTransformer
+      ↓                          (hidden=128)    (d_model=256, 4 layers,
+  Dense(256)                     BiLSTM → 256-D   8 heads, ff=512, pre-norm GELU)
+      ↓                                │                 │
+      ↓                          Attention Pool    Mean Pooling
+      ↓                          (temp = √256)    sobre tokens (T)
+      ↓                                └────────┬────────┘
+      ↓                                         ↓
+      ↓                                  LayerNorm(256)
+      ↓                                         ↓
+      └────────────── WeightedFusion ───────────┘
+                   (w_r · static + w_e · dynamic)
+                              ↓
+                      Destination Head
+           MLP(256 → 1024 → 512 logits) ─► softmax
+                              ↓
+                  Σ(p_k · cluster_centers_k)
+                              ↓
+                    Predicted (x, y) ∈ [0,1]²
 ```
 
 ### 2.1 Fases Implementadas (v2)
@@ -66,12 +73,10 @@ POI Proj (32-D GELU) ─┘                 Attention Pooling
 | 2 | Loss **CE sobre clusters KMeans** + MSE auxiliar (α=0.1) | ✅ |
 | 3 | **Attention pooling** sobre todos os outputs do LSTM | ✅ |
 | 4 | **Scheduled sampling** (ramp linear 0 → `max_scheduled_p`) | ✅ |
-| **5** | **Substituir BiLSTM por Transformer Encoder** | 🔵 Próxima |
+| **5** | **Transformer Encoder como alternativa ao BiLSTM (`encoder_type` switch)** | ✅ Implementado — aguardando run de comparação |
 | 6 | Cobertura de usuários (seq_len adaptativo para C/D) | 🔵 Futuro |
 
 ### 2.2 Correções de Arquitetura (2026-04-14)
-
-Bugs identificados e corrigidos após análise detalhada:
 
 | Problema | Arquivo | Correção |
 |----------|---------|----------|
@@ -82,42 +87,45 @@ Bugs identificados e corrigidos após análise detalhada:
 
 ### 2.3 Invariantes Críticos da Arquitetura
 
-- **`fusion_dim` DEVE ser igual a `lstm_hidden * 2`** — `WeightedFusion` tem assert que quebra em runtime caso contrário
+- **`fusion_dim` DEVE ser igual à saída do encoder** — `WeightedFusion` tem assert que quebra em runtime. Para BiLSTM: `fusion_dim == lstm_hidden * 2`. Para Transformer: `fusion_dim == d_model` (por construção `d_model = fusion_dim`).
 - **`poi_proj = Linear(85, poi_out_dim)`** — POI_norm é array de 85 dimensões (coluna `object` no parquet)
 - **`n_users >= max(uid) + 1`** — uids vão de 0 a 99999 em todas as cidades
 - **Cluster centers são fixos** (`register_buffer`, não treináveis)
 - **`tracking_uri`** — use `file:/tmp/mlruns` em smoke para evitar erros de permissão
+- **`encoder_type` + hiperparâmetros do Transformer** são salvos no `config` do checkpoint — fine-tuning e avaliação reconstroem o encoder correto automaticamente.
 
 ---
 
 ## 3. Status Atual (2026-04-15)
 
-### 3.1 Primeira Epoch de Treino v2 Completada
+### 3.1 Treino BiLSTM em andamento (baseline para comparação)
 
 Config: `config/exp_full_15d_a4000.yaml` (seq_len=336, lr=1e-4, max_scheduled_p=0.3)
 
+**Epoch 1 completada:**
 | Métrica | Valor |
 |---------|-------|
 | Train loss (CE+MSE) | **4.1226** |
 | Val loss (MSE) | **0.0071** |
 | Tempo por epoch | ~9h |
 | Batches por epoch | ~24.500 |
-| Val batches | 199 (de `max_val_batches=200`) |
 
-**Observações:**
-- Val loss **real** pela primeira vez (antes sempre 0.0000 devido ao bug do `criterion`)
-- Train loss caindo (baseline uniforme CE sobre 512 clusters seria log(512)=6.24)
-- Gradientes **continuam explodindo** (pre-clip entre 11 e 59 em quase todo batch, clip em 2.0)
+**Epoch 2 em andamento (snapshot ~12.9k/24.5k it):**
+- Train loss oscilando em ~3.3–4.3 (running avg = 3.41)
+- Val loss real pela primeira vez (antes 0.0000 pelo bug do `criterion`)
+- Baseline uniforme CE sobre 512 clusters = log(512) ≈ 6.24 → o modelo está aprendendo, mas desacelerando
 
-### 3.2 Problema Estrutural: BPTT em BiLSTM
+### 3.2 Gargalo estrutural: BPTT em BiLSTM
 
-Com seq_len=336, o LSTM faz backprop por 336 passos. Os gradientes se multiplicam recursivamente pelas matrizes de transição — resultado: **pre-clip entre 11-59 em quase todo batch**, com clip em 2.0 cortando >90% do sinal.
+Com seq_len=336, o LSTM faz backprop por 336 passos. Os gradientes se multiplicam recursivamente pelas matrizes de transição — observado empiricamente:
 
-Essa é uma limitação intrínseca de LSTMs sobre sequências longas. Truncated BPTT mitigaria, mas a solução arquiteturalmente correta é migrar para Transformer.
+- **Pre-clip entre 12–59** em virtualmente todo batch da epoch 2
+- **GradNorm pós-clip saturada em 2.0** (valor do clip) constantemente
+- Clip cortando >90% do sinal em praticamente todo step
 
-### 3.3 Baseline v1 (Para Comparação)
+Essa saturação é a principal motivação para avaliar o Transformer Encoder: atenção processa todos os timesteps em paralelo, sem recursão no backward → elimina a fonte estrutural da explosão.
 
-Arquitetura subparametrizada anterior (`lstm_hidden=4`, `fusion_dim=8`, MSE loss):
+### 3.3 Baseline v1 (subparametrizado, referência histórica)
 
 | Métrica | Cidade B | Cidade C | Cidade D | Top HuMob 2024 |
 |---------|----------|----------|----------|----------------|
@@ -126,14 +134,16 @@ Arquitetura subparametrizada anterior (`lstm_hidden=4`, `fusion_dim=8`, MSE loss
 
 ---
 
-## 4. Fase 5 — Migração para Transformer Encoder
+## 4. Fase 5 — Comparação BiLSTM vs Transformer Encoder
 
-### 4.1 Motivação
+### 4.1 Decisão de Design: Comparação, Não Substituição
 
-1. **Elimina BPTT** — atenção processa todos os timesteps em paralelo, sem propagação recursiva de gradiente. Fim da explosão estrutural.
-2. **Teto de performance mais alto** — top HuMob 2024 usou Transformers; literatura consolidada para mobilidade.
-3. **Paraleliza no tempo** — LSTM é sequencial; Transformer pode ser 3–5× mais rápido por epoch em GPU.
-4. **Padrões de longo alcance** — atenção global captura naturalmente "mesmo horário na semana passada" sem degradação.
+O Transformer **não substitui** o BiLSTM — é implementado como **encoder alternativo** selecionável via YAML. Motivos:
+
+1. **Ablação obrigatória para o paper.** A pergunta "quanto o Transformer realmente ajudou?" exige os dois números lado a lado com mesma config, mesmo seed, mesmo dataset.
+2. **Narrativa empírica.** "Identificamos BPTT saturando o clip (evidência: grad pre-clip 12–59 em toda epoch 2) e migramos para atenção" é história completa com os dois treinos; é anedota com um só.
+3. **Fallback sem custo.** Se Transformer overfittar em B/C/D (dados esparsos), o BiLSTM continua disponível sem reversão de código.
+4. **Aproveita trabalho já feito.** Quase 2 epochs de BiLSTM já foram pagas; descartar = desperdício.
 
 ### 4.2 Design do `CoordTransformer`
 
@@ -142,170 +152,181 @@ class CoordTransformer(nn.Module):
     def __init__(self, input_size=2, d_model=256, nhead=8,
                  num_layers=4, dim_feedforward=512, max_len=720,
                  dropout=0.1):
-        # 1. Projeção de entrada (2-D → 256-D)
         self.input_proj = nn.Linear(input_size, d_model)
-
-        # 2. Positional encoding aprendível (seq_len fixo por config)
         self.pos_embedding = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
-
-        # 3. Encoder: N camadas de self-attention + FFN
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout, batch_first=True,
-            activation='gelu', norm_first=True  # pre-norm: mais estável
+            dim_feedforward=dim_feedforward, dropout=dropout,
+            batch_first=True, activation='gelu', norm_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-
-        # 4. Pooling: mean pooling ou CLS token (TBD)
         self.output_dim = d_model
 
-    def forward(self, x):
-        # x: (B, T, 2)
+    def forward(self, x):                               # (B, T, 2)
         h = self.input_proj(x) + self.pos_embedding[:, :x.size(1)]
-        h = self.encoder(h)              # (B, T, d_model)
-        return h.mean(dim=1)             # mean pooling → (B, d_model)
+        h = self.encoder(h)                             # (B, T, d_model)
+        return h.mean(dim=1)                            # (B, d_model)
 ```
 
-### 4.3 Parâmetros Escolhidos e Justificativa
+### 4.3 Parâmetros Escolhidos
 
 | Parâmetro | Valor | Por quê |
 |-----------|-------|---------|
-| `d_model` | 256 | Mesmo valor de `fusion_dim` atual — mantém `WeightedFusion` funcionando sem mudança |
-| `nhead` | 8 | Head size = 32-D, razoável para coordenadas |
-| `num_layers` | 4 | Começar com 4; 6 se houver memória sobrando |
+| `d_model` | 256 | Igual a `fusion_dim` — mantém `WeightedFusion` sem mudança |
+| `nhead` | 8 | Head size = 32-D, adequado |
+| `num_layers` | 4 | Começar com 4; 6 se sobrar memória |
 | `dim_feedforward` | 512 | 2× d_model, conservador |
-| `dropout` | 0.1 | Baixo; sequências longas e batches grandes ajudam a regularizar |
-| `norm_first` | True | Pre-norm: mais estável em treinamento do zero |
-| `activation` | GELU | Consistente com resto do modelo |
-| Pooling | Mean | Simples e robusto; considerar CLS token em experimento posterior |
+| `dropout` | 0.1 | Baixo; batches grandes regularizam |
+| `norm_first` | True | Pre-norm: mais estável treinando do zero |
+| `activation` | GELU | Consistente com o resto do modelo |
+| Pooling | Mean | Simples; CLS token em experimento futuro |
 
-### 4.4 Complexidade Computacional
+### 4.4 Plano de Comparação
 
-- **Atenção global** em seq_len=336: O(336²) = 113k operações por head
-- Com 8 heads × 4 layers = 3.6M operações de atenção por sample
-- Batch=64 → 230M operações por batch — cabe facilmente em 16GB VRAM
-- **Memória de atenção:** 336² × 8 × 4 bytes × 64 batch ≈ 230MB por layer → ~1GB total, aceitável
+**Precondições (antes de parar o BiLSTM):**
+1. Deixar BiLSTM completar suficientes epochs para ser baseline sólido — idealmente até convergência ou platô claro (val_loss sem melhoria em 2–3 epochs seguidas).
+2. Rodar fine-tuning automático em B → C → D (pipeline já faz).
+3. Gerar `pred_gt_all_users.parquet` e calcular GEO-BLEU + DTW para A/B/C/D com `evaluate_metrics.py`.
+4. **Salvar artefatos com nomes distintos:**
+   ```
+   outputs/models/humob_model_A_lstm_baseline.pt
+   outputs/models/humob_model_finetuned_{B,C,D}_lstm_baseline.pt
+   outputs/eval/pred_gt_all_users_lstm.parquet
+   outputs/eval/metrics_lstm.json
+   ```
+5. Taggear o run MLflow com `encoder_type=lstm`.
 
-Se no futuro quisermos voltar a `seq_len=720`, aí entra **atenção local** (janela de 48 = 1 dia), que é O(720 × 48) em vez de O(720²).
+**Rodada Transformer (mesma config, só trocando encoder):**
+1. Checkout `feature/transformer-encoder` e confirmar `encoder.type: transformer` no YAML.
+2. **Smoke test primeiro** (`config/smoke_v2.yaml` com `encoder.type: transformer`) — valida forward/backward/save em minutos, evita descobrir bug de shape após 1h de setup.
+3. Limpar checkpoints do LSTM (eles são incompatíveis):
+   ```bash
+   rm -f outputs/models/humob_model_A.pt outputs/models/checkpoints/*.pt
+   ```
+4. Rodar pipeline completo com mesmo seed, mesmo dataset, mesmo lr/bs/seq_len/scheduled_sampling.
+5. Gerar artefatos `*_transformer.*` análogos.
 
-### 4.5 Arquivos a Modificar
+**Comparação final (tabela principal do paper):**
 
-| Arquivo | Mudança |
-|---------|---------|
-| `src/models/partial_info_transformer.py` | **Novo** — classe `CoordTransformer` |
-| `src/models/humob_model.py` | Condicional `encoder_type` no `__init__` para escolher LSTM ou Transformer |
-| `config/exp_full_15d_a4000.yaml` | Adicionar bloco `encoder:` com hiperparâmetros do Transformer |
-| `run_automate.py` | Ler `encoder_type` e hiperparâmetros do YAML |
-| `PRD.md` e `CLAUDE.md` | Documentar a nova arquitetura |
+| Modelo | City A GEO-BLEU | City A DTW | City B GEO-BLEU | City B DTW | City C GEO-BLEU | City C DTW | City D GEO-BLEU | City D DTW | Grad satura clip? | Tempo/epoch |
+|---|---|---|---|---|---|---|---|---|---|---|
+| BiLSTM (v2)    | ? | ? | ? | ? | ? | ? | ? | ? | ✓ | ~9h |
+| Transformer    | ? | ? | ? | ? | ? | ? | ? | ? | ? | ? |
+| Top HuMob 2024 | — | — | — | — | — | — | 0.319 | 27.15 | — | — |
 
-### 4.6 Estratégia de Migração
+**Critérios de decisão para o paper:**
+- Se Transformer vence em ≥3 das 4 cidades com margem > 5% relativo → arquitetura principal proposta.
+- Se empata ou perde → reportar ambos como "arquiteturas equivalentes; BiLSTM suficiente para este domínio" (resultado negativo ainda é resultado).
+- Figura obrigatória: **curva de GradNorm pre-clip × step** dos dois — demonstra visualmente o gargalo resolvido.
 
-1. **Implementar `CoordTransformer`** em paralelo ao `CoordLSTM` (não remover ainda)
-2. **Config condicional:** `encoder_type: "lstm" | "transformer"` no YAML
-3. **Rodar smoke** com Transformer para validar forward/backward/loss
-4. **Rodar experimento completo com Transformer** (`n_epochs: 15`, finetune como sempre)
-5. **Comparar GEO-BLEU/DTW** com v2 BiLSTM (epoch 1 atual como baseline)
-6. **Se Transformer vencer** — remover CoordLSTM em um commit separado
+### 4.5 Complexidade Computacional
 
-### 4.7 Riscos e Mitigações
+- Atenção global em seq_len=336: O(336²) ≈ 113k ops por head
+- 8 heads × 4 layers × 64 batch ≈ 230M ops/batch — cabe em 16GB VRAM
+- Memória de atenção: ~1GB total, aceitável
+- Para seq_len=720 futuro, considerar atenção local (janela=48 = 1 dia), O(720×48)
+
+### 4.6 Riscos e Mitigações
 
 | Risco | Mitigação |
 |-------|-----------|
+| Transformer não testado end-to-end | Smoke test obrigatório antes do full run |
 | Overfitting em seq longas com poucos dados por user | Dropout 0.1 + weight decay; monitorar val_loss |
-| Positional encoding fixo não generaliza para seq_len variáveis | Usar seq_len fixo no config; avaliar com mesmo seq_len |
-| Transformer não aprende padrões curtos tão bem quanto LSTM | Mean pooling sobre toda sequência captura ambos |
-| Memória explodir com batch grande | Começar com batch=64 (igual atual); `torch.compile` se precisar |
+| Positional encoding aprendido não generaliza seq variáveis | seq_len fixo por config; avaliação com mesmo seq_len |
+| Comparação injusta por seed/timing diferente | Mesma seed, mesma config YAML, mesmo hardware |
 
 ---
 
-## 5. Próximas Fases (Pós-Transformer)
+## 5. Próximas Fases
 
 ### Fase 6 — Cobertura de Usuários em C e D
 
 Com seq_len=336, City D (média 76 pts/user) ainda filtra maioria dos usuários. Opções:
+- Seq_len adaptativo na avaliação (144 para users <336 pontos)
+- Re-treino multi-seq-len (modelo aceita qualquer seq_len ≥ 48)
+- Modelo unificado multi-cidade (sem FT, usando `city_emb`)
 
-- **Seq_len adaptativo na avaliação** — usar 144 para users com <336 pontos
-- **Re-treino multi-seq-len** — modelo aceita qualquer seq_len fixo ≥ 48
-- **Modelo unificado multi-cidade** — treinar sem fine-tuning usando `city_emb` como diferenciador
+### Fase 7 — Ablações Adicionais para o Paper
 
-### Fase 7 — Ablation Study para o Artigo
-
-- Transformer vs BiLSTM (same hyperparams)
-- Com/sem attention pooling
+- Com/sem attention pooling (no BiLSTM)
 - CE vs MSE loss
 - Scheduled sampling on/off
 - Com/sem POI features
+- Transformer: 4 vs 6 layers, mean vs CLS pooling
 
 ---
 
 ## 6. Bugs Conhecidos e Histórico
 
-### Bugs Ativos (não corrigidos)
+### Bugs Ativos
 
-- **BPTT estrutural em BiLSTM** — gradientes explodem (pre=11-59, clip=2.0). **Solução: Fase 5 (Transformer).**
-- **Cobertura em City D** — 76 pts/user, seq_len=336 requer 337. Solução: Fase 6.
+- **BPTT estrutural em BiLSTM** — pre-clip 12–59, GradNorm saturada em 2.0. É o gargalo que motiva a comparação com Transformer (Fase 5).
+- **Cobertura em City D** — 76 pts/user vs seq_len=336. Solução: Fase 6.
 
-### Bugs Corrigidos em 2026-04-14 (sessão de diagnóstico)
+### Bugs Corrigidos em 2026-04-14
 
-1. **Val loop `criterion` undefined** — `criterion` só existia em `evaluate_model`, não em `train_humob_model`. Todas as batches de val lançavam `NameError` silenciosamente → `val_count=0` → `val_loss=0.0` → early stopping falso.
-2. **Attention collapse** — softmax sem temperatura sobre 336 timesteps colapsa em 1-2 posições.
-3. **LSTM output sem LayerNorm** — magnitude de `dyn_emb` divergia de `static_red` (que tinha LayerNorm), desbalanceando o WeightedFusion.
-4. **ReLU matando features temporais/POI** — Xavier init + features em [0,1] zera metade dos neurônios.
-5. **Config `sequence_length=720`** — descartava maioria dos users de C/D (média 76 pts/user em D). Reduzido para 336.
-6. **Config `max_scheduled_p=0.7`** — agressivo demais treinando do zero. Reduzido para 0.3.
-7. **Config `learning_rate=3e-5`** — conservador pós-fixes de arquitetura. Aumentado para 1e-4.
+1. **Val loop `criterion` undefined** — `criterion` só existia em `evaluate_model`. Val silenciosamente lançava `NameError` → `val_loss=0.0`.
+2. **Attention collapse** — softmax sem temperatura colapsa em 1–2 posições.
+3. **LSTM output sem LayerNorm** — magnitude divergia de `static_red`, desbalanceando WeightedFusion.
+4. **ReLU matando features temporais/POI** — Xavier + inputs em [0,1] zera metade dos neurônios.
+5. **`sequence_length=720`** — descartava maioria de C/D. Reduzido para 336.
+6. **`max_scheduled_p=0.7`** — agressivo do zero. Reduzido para 0.3.
+7. **`learning_rate=3e-5`** — conservador pós-fixes. Aumentado para 1e-4.
 
 ### Bugs Corrigidos Anteriormente
 
-- **`val_days` insuficiente no finetune** — `(0.8, 1.0)` = 15 dias = seq_len → zero sequências. Corrigido para `(0.5, 1.0)`.
-- **Flush prematuro do spillover** em `dataset.py` — usuários com dados esparsos perdiam sequências.
-- **MLflow sobrescrevia métricas** — `compare_models_performance` agrupava todos os modelos no mesmo run.
+- `val_days=(0.8, 1.0)` no finetune → zero sequências. Corrigido para `(0.5, 1.0)`.
+- Flush prematuro do spillover em `dataset.py`.
+- MLflow sobrescrevia métricas em `compare_models_performance`.
 
 ---
 
 ## 7. Infraestrutura
 
-### 7.1 Servidor de Treinamento (cia6)
+### 7.1 Servidor cia6
 
 | Item | Valor |
 |------|-------|
-| Host | `192.168.222.252` (acesso via VPN) |
+| Host | `192.168.222.252` (VPN) |
 | Usuário | `anderson.clemente` (**sem sudo**) |
 | GPU | NVIDIA RTX A4000 (16 GB VRAM) |
 | Repositório | `~/clnn_v2/` |
-| Docker image | `humob:cu128` (~9.2 GB, já construída) |
+| Docker image | `humob:cu128` (~9.2 GB) |
+| Branch Transformer | `feature/transformer-encoder` |
 
 ### 7.2 Execução
 
 ```bash
-# VPN (terminal 1, deixar rodando)
+# VPN (terminal 1)
 sudo openvpn --config ~/client.ovpn
 
 # SSH + tmux (terminal 2)
 ssh anderson.clemente@192.168.222.252
 tmux new -s humob_full
 
-# Docker SEM sudo (usuário está no grupo docker)
+# Treino BiLSTM (branch main)
 cd ~/clnn_v2
-docker run --rm --gpus all \
-  -e PYTHONPATH=/workspace \
+docker run --rm --gpus all -u $(id -u):$(id -g) \
+  -e PYTHONPATH=/workspace -e MPLCONFIGDIR=/tmp/mpl \
   -v "$PWD:/workspace" humob:cu128 \
   python /workspace/run_automate.py --config /workspace/config/exp_full_15d_a4000.yaml
 
-# Avaliação oficial (GEO-BLEU + DTW)
-docker run --rm --gpus all \
-  -e PYTHONPATH=/workspace \
-  -v "$PWD:/workspace" humob:cu128 \
+# Treino Transformer (branch feature/transformer-encoder, mesma config com encoder.type=transformer)
+git checkout feature/transformer-encoder
+rm -f outputs/models/humob_model_A.pt outputs/models/checkpoints/*.pt
+# (mesmo comando docker run acima)
+
+# Avaliação oficial
+docker run --rm --gpus all -u $(id -u):$(id -g) \
+  -e PYTHONPATH=/workspace -v "$PWD:/workspace" humob:cu128 \
   python /workspace/evaluate_metrics.py
 ```
 
-### 7.3 Permissões (gotchas)
+### 7.3 Permissões
 
-- Container roda como `laccan` (UID 1000, appuser da imagem)
-- Arquivos no host criados por `anderson.clemente` (UID diferente) precisam `chmod o+w`
-- `mlruns/` deve ser 757 ou compatível para o container escrever
-- Checkpoints em `outputs/models/checkpoints/` ficam owned por `laccan` — o container pode sobrescrever nas próximas epochs
+- Container roda como `laccan` (UID 1000); host como `anderson.clemente` → sempre rodar com `-u $(id -u):$(id -g)`
+- `mlruns/` em 757 funciona
+- Checkpoints anteriores owned por `laccan` podem precisar `chmod o+w`
 
 ---
 
@@ -314,53 +335,54 @@ docker run --rm --gpus all \
 ```
 clnn_v2/
 ├── config/
-│   ├── smoke_v2.yaml               # Teste rápido (seq_len=12, 2 epochs, checkpoints)
-│   └── exp_full_15d_a4000.yaml     # ★ Config de produção
+│   ├── smoke_v2.yaml               # Smoke (seq_len=12, 2 epochs)
+│   └── exp_full_15d_a4000.yaml     # ★ Produção (encoder.type configurável)
 ├── src/
 │   ├── data/dataset.py             # HuMobNormalizedDataset (IterableDataset + spillover)
 │   ├── models/
-│   │   ├── humob_model.py          # HuMobModel (escolhe encoder via config)
+│   │   ├── humob_model.py          # HuMobModel (encoder_type: lstm|transformer)
 │   │   ├── external_info.py        # Embeddings + projeções GELU
-│   │   ├── partial_info.py         # CoordLSTM com attention pooling + temperatura
-│   │   └── partial_info_transformer.py  # (a criar — Fase 5)
+│   │   ├── partial_info.py         # CoordLSTM (attention pool + temperatura)
+│   │   └── partial_info_transformer.py  # CoordTransformer (mean pool, pre-norm GELU)
 │   ├── training/
-│   │   ├── train.py                # train_humob_model com CE+MSE loss
-│   │   ├── finetune.py             # Fine-tuning sequencial B→C→D
+│   │   ├── train.py                # train_humob_model (CE+MSE, encoder passthrough)
+│   │   ├── finetune.py             # FT sequencial; reconstrói encoder do checkpoint
 │   │   └── pipeline.py             # generate_humob_submission + pred_gt_parquet
 │   └── utils/
 │       ├── metrics.py              # compute_geobleu() + compute_dtw()
-│       ├── mlflow_tracker.py       # HuMobMLflowTracker
-│       └── simple_checkpoint.py    # save/load/cleanup
-├── run_automate.py                 # ★ Ponto de entrada (YAML → pipeline completo)
-├── evaluate_metrics.py             # ★ GEO-BLEU + DTW a partir do pred_gt_all_users.parquet
+│       ├── mlflow_tracker.py
+│       └── simple_checkpoint.py
+├── run_automate.py                 # ★ Entrada: YAML → pipeline completo
+├── evaluate_metrics.py             # ★ GEO-BLEU + DTW a partir de pred_gt
 ├── PRD.md                          # ★ Este arquivo
-├── CLAUDE.md                       # Contexto rápido para novas sessões
-├── dockerfile                      # pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
+├── CLAUDE.md
+├── dockerfile
 └── data/
-    └── humob_all_cities_v2_normalized.parquet  # ~4.2 GB, normalizado
+    └── humob_all_cities_v2_normalized.parquet  # ~4.2 GB
 ```
 
 ---
 
-## 9. Stack Tecnológica
+## 9. Stack
 
 | Componente | Tecnologia |
 |------------|------------|
-| Framework ML | PyTorch 2.7 |
+| Framework | PyTorch 2.7 |
 | GPU | CUDA 12.8 + cuDNN 9 |
-| Dados | Parquet (PyArrow) ~4.2 GB |
-| Tracking | MLflow local (`file:./mlruns`) |
-| Container | Docker `humob:cu128` (~9.2 GB) |
-| Hardware | NVIDIA RTX A4000 (16 GB VRAM) |
-| Métricas | geobleu (Yahoo Japan) + fastdtw |
+| Dados | Parquet (PyArrow) |
+| Tracking | MLflow local |
+| Container | Docker `humob:cu128` |
+| Hardware | NVIDIA RTX A4000 (16 GB) |
+| Métricas | geobleu (Yahoo) + fastdtw |
 
 ---
 
 ## 10. Convenções
 
-- **Sempre rodar via Docker** — nunca instalar dependências direto no servidor
-- **Dados em [0,1]** — não desnormalizar antes do modelo
-- **Coordenadas discretas** via `discretize_coordinates()` para submissão (grade 0–199)
-- **Branch única `main`** — trabalho em feature branches, merge ao concluir
-- **Checkpoints** em `outputs/models/checkpoints/` — mantém os 3 últimos
-- **Nunca executar experimentos remotamente via SSH na sessão** — o usuário roda em seu próprio tmux
+- **Docker para tudo** — não instalar deps no host
+- **Dados em [0,1]** — não desnormalizar
+- **`discretize_coordinates()`** para converter pred em célula 0–199
+- **Feature branches** → merge ao concluir; `feature/transformer-encoder` é a ativa
+- **Checkpoints** em `outputs/models/checkpoints/` (3 últimos)
+- **Nunca executar experimentos via SSH na sessão** — usuário roda em seu tmux
+- **Comparação justa**: mesma seed, mesmo YAML (só trocar `encoder.type`), mesma GPU
