@@ -88,6 +88,13 @@ def run_from_yaml(cfg_path: str) -> None:
     max_scheduled_p = float(_get(cfg, "model.max_scheduled_p", 0.0))
     max_users = int(_get(cfg, "model.max_users", 0))
 
+    # Fase 5 — encoder selection (LSTM vs Transformer)
+    encoder_type = str(_get(cfg, "model.encoder.type", _get(cfg, "model.encoder_type", "lstm")))
+    transformer_nhead = int(_get(cfg, "model.encoder.transformer_nhead", 8))
+    transformer_num_layers = int(_get(cfg, "model.encoder.transformer_num_layers", 4))
+    transformer_ff_dim = int(_get(cfg, "model.encoder.transformer_ff_dim", 512))
+    transformer_dropout = float(_get(cfg, "model.encoder.transformer_dropout", 0.1))
+
     base_cfg = _get(cfg, "training.base", {}) or {}
     ft_cfg = _get(cfg, "training.finetune", {}) or {}
 
@@ -118,6 +125,7 @@ def run_from_yaml(cfg_path: str) -> None:
     print(f"   arch: user_emb={user_emb_dim}, city_emb={city_emb_dim}, temporal={temporal_dim}, "
           f"poi_out={poi_out_dim}, lstm_hidden={lstm_hidden}, fusion={fusion_dim}")
     print(f"   loss_alpha={loss_alpha}, max_scheduled_p={max_scheduled_p}")
+    print(f"   encoder={encoder_type} (nhead={transformer_nhead}, layers={transformer_num_layers}, ff={transformer_ff_dim}, dropout={transformer_dropout})")
     print(f"   base: epochs={base_epochs}, bs={base_bs}, lr={base_lr}, amp={base_mixed}, city={base_city}")
     print(f"   ft:   epochs={ft_epochs},  bs={ft_bs},  lr={ft_lr},  cities={ft_cities}")
 
@@ -164,6 +172,11 @@ def run_from_yaml(cfg_path: str) -> None:
         max_train_batches=max_train_batches,
         max_val_batches=max_val_batches,
         resume_from_checkpoint=resume_checkpoint,
+        encoder_type=encoder_type,
+        transformer_nhead=transformer_nhead,
+        transformer_num_layers=transformer_num_layers,
+        transformer_ff_dim=transformer_ff_dim,
+        transformer_dropout=transformer_dropout,
     )
     print(f"   ✅ Treino base concluído -> {base_ckpt.name}")
 

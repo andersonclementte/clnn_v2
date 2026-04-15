@@ -120,6 +120,11 @@ def finetune_model(
         poi_out_dim=int(config.get('poi_out_dim', 4)),
         lstm_hidden=int(config.get('lstm_hidden', 4)),
         fusion_dim=int(config.get('fusion_dim', 8)),
+        encoder_type=str(config.get('encoder_type', 'lstm')),
+        transformer_nhead=int(config.get('transformer_nhead', 8)),
+        transformer_num_layers=int(config.get('transformer_num_layers', 4)),
+        transformer_ff_dim=int(config.get('transformer_ff_dim', 512)),
+        transformer_dropout=float(config.get('transformer_dropout', 0.1)),
     ).to(device)
 
     model.load_state_dict(state, strict=True)

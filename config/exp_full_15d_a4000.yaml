@@ -23,13 +23,20 @@ model:
   loss_alpha: 0.1
   # Fase 4 — scheduled sampling
   max_scheduled_p: 0.3
+  # Fase 5 — encoder selection
+  encoder:
+    type: "transformer"          # "lstm" | "transformer"
+    transformer_nhead: 8
+    transformer_num_layers: 4
+    transformer_ff_dim: 512
+    transformer_dropout: 0.1
 
 training:
   base:
     n_epochs: 20
     learning_rate: 1e-4
     batch_size: 64
-    resume_from_checkpoint: false
+    resume_from_checkpoint: true
     max_val_batches: 200
     mixed_precision: true
   finetune:

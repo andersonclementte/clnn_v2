@@ -194,6 +194,11 @@ def train_humob_model(
     max_users: int = 0,
     max_train_batches: int = 0,
     max_val_batches: int = 0,
+    encoder_type: str = "lstm",
+    transformer_nhead: int = 8,
+    transformer_num_layers: int = 4,
+    transformer_ff_dim: int = 512,
+    transformer_dropout: float = 0.1,
 ):
     """Treina o modelo HuMob com dados normalizados e tracking MLflow."""
     print("🏋️ Iniciando treinamento do modelo HuMob...")
@@ -240,7 +245,12 @@ def train_humob_model(
         lstm_hidden=lstm_hidden,
         fusion_dim=fusion_dim,
         sequence_length=sequence_length,
-        prediction_steps=1
+        prediction_steps=1,
+        encoder_type=encoder_type,
+        transformer_nhead=transformer_nhead,
+        transformer_num_layers=transformer_num_layers,
+        transformer_ff_dim=transformer_ff_dim,
+        transformer_dropout=transformer_dropout,
     ).to(device)
     
     # 3. Setup de treino
@@ -462,6 +472,11 @@ def train_humob_model(
                     'lstm_hidden': lstm_hidden,
                     'fusion_dim': fusion_dim,
                     'max_scheduled_p': max_scheduled_p,
+                    'encoder_type': encoder_type,
+                    'transformer_nhead': transformer_nhead,
+                    'transformer_num_layers': transformer_num_layers,
+                    'transformer_ff_dim': transformer_ff_dim,
+                    'transformer_dropout': transformer_dropout,
                 },
                 'train_loss': float(avg_train_loss),
                 'mlflow_run_id': run_id
@@ -509,6 +524,11 @@ def train_humob_model(
                     'lstm_hidden': lstm_hidden,
                     'fusion_dim': fusion_dim,
                     'max_scheduled_p': max_scheduled_p,
+                    'encoder_type': encoder_type,
+                    'transformer_nhead': transformer_nhead,
+                    'transformer_num_layers': transformer_num_layers,
+                    'transformer_ff_dim': transformer_ff_dim,
+                    'transformer_dropout': transformer_dropout,
                 },
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
@@ -606,6 +626,11 @@ def evaluate_model(
         poi_out_dim=int(cfg.get('poi_out_dim', 4)),
         lstm_hidden=int(cfg.get('lstm_hidden', 4)),
         fusion_dim=int(cfg.get('fusion_dim', 8)),
+        encoder_type=str(cfg.get('encoder_type', 'lstm')),
+        transformer_nhead=int(cfg.get('transformer_nhead', 8)),
+        transformer_num_layers=int(cfg.get('transformer_num_layers', 4)),
+        transformer_ff_dim=int(cfg.get('transformer_ff_dim', 512)),
+        transformer_dropout=float(cfg.get('transformer_dropout', 0.1)),
     ).to(device)
     model.load_state_dict(state, strict=True)
     model.eval()

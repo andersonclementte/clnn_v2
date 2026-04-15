@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from src.models.external_info import ExternalInformationFusionNormalized, ExternalInformationDense
 from src.models.partial_info import CoordLSTM
+from src.models.partial_info_transformer import CoordTransformer
 
 
 class WeightedFusion(nn.Module):
@@ -71,6 +72,12 @@ def discretize_coordinates(coords_pred: torch.Tensor, grid_size: int = 200):
 class HuMobModel(nn.Module):
     """
     Modelo completo que combina todas as partes e faz rollout para múltiplos passos.
+
+    Suporta dois tipos de encoder de sequência (configurável via encoder_type):
+    - "lstm": BiLSTM com attention pooling (v2, default por compat.)
+    - "transformer": Transformer Encoder com mean pooling (Fase 5)
+
+    Ambos têm output_dim = fusion_dim, mantendo a invariante do WeightedFusion.
     """
     def __init__(
         self,
@@ -85,12 +92,19 @@ class HuMobModel(nn.Module):
         fusion_dim: int = 8,
         sequence_length: int = 48,
         prediction_steps: int = 1,
-        disable_poi: bool = False
+        disable_poi: bool = False,
+        # Fase 5: escolha de encoder
+        encoder_type: str = "lstm",
+        transformer_nhead: int = 8,
+        transformer_num_layers: int = 4,
+        transformer_ff_dim: int = 512,
+        transformer_dropout: float = 0.1
     ):
         super().__init__()
         
         self.sequence_length = sequence_length
         self.prediction_steps = prediction_steps
+        self.encoder_type = encoder_type
         
         self.fusion = ExternalInformationFusionNormalized(
             n_users=n_users,
@@ -105,16 +119,43 @@ class HuMobModel(nn.Module):
             in_dim=self.fusion.out_dim,
             out_dim=fusion_dim
         )
-        self.lstm = CoordLSTM(
-            input_size=2,
-            hidden_size=lstm_hidden,
-            bidirectional=True
+
+        # Encoder de sequência (LSTM ou Transformer)
+        if encoder_type == "lstm":
+            self.encoder = CoordLSTM(
+                input_size=2,
+                hidden_size=lstm_hidden,
+                bidirectional=True
+            )
+            encoder_output_dim = lstm_hidden * 2
+        elif encoder_type == "transformer":
+            self.encoder = CoordTransformer(
+                input_size=2,
+                d_model=fusion_dim,
+                nhead=transformer_nhead,
+                num_layers=transformer_num_layers,
+                dim_feedforward=transformer_ff_dim,
+                max_len=sequence_length + 1,
+                dropout=transformer_dropout
+            )
+            encoder_output_dim = fusion_dim
+        else:
+            raise ValueError(
+                f"encoder_type inválido: {encoder_type!r}. Use 'lstm' ou 'transformer'."
+            )
+
+        # Invariante crítica: encoder_output_dim DEVE bater com fusion_dim
+        # (WeightedFusion assert exige static_red e dyn_emb do mesmo tamanho)
+        assert encoder_output_dim == fusion_dim, (
+            f"encoder output_dim ({encoder_output_dim}) deve ser igual a "
+            f"fusion_dim ({fusion_dim}). Para LSTM: lstm_hidden*2 == fusion_dim."
         )
-        self.lstm_norm = nn.LayerNorm(lstm_hidden * 2)
+
+        self.encoder_norm = nn.LayerNorm(encoder_output_dim)
         self.weighted_fusion = WeightedFusion(dim=fusion_dim)
         self.destination_head = DestinationHead(
             in_dim=fusion_dim,
-            hidden_dim=max(fusion_dim * 4, 64),  # head proporcional ao fusion_dim
+            hidden_dim=max(fusion_dim * 4, 64),
             cluster_centers=cluster_centers
         )
         self._stable_init()
@@ -127,7 +168,7 @@ class HuMobModel(nn.Module):
         """
         static_emb = self.fusion(uid, d_norm, t_sin, t_cos, city, poi_norm)
         static_red = self.dense(static_emb)
-        dyn_emb = self.lstm_norm(self.lstm(coords_seq))
+        dyn_emb = self.encoder_norm(self.encoder(coords_seq))
         fused = self.weighted_fusion(static_red, dyn_emb)
         return self.destination_head(fused, return_logits=return_logits)
 
