@@ -1,550 +1,366 @@
 # PRD — CLNN v2: Human Mobility Prediction
 
-> **Última atualização:** 2026-04-14
-> **Contexto:** Este documento consolida todo o conhecimento adquirido até abril de 2026, incluindo bugs corrigidos, resultados reais com métricas oficiais, diagnóstico do modelo atual e plano de implementação para as próximas melhorias. Escrito para que qualquer LLM ou desenvolvedor possa retomar o trabalho sem perda de contexto.
+> **Última atualização:** 2026-04-15
+> **Status:** v2 (BiLSTM + CE loss + Attention pooling) rodou com sucesso na epoch 1. Migração para Transformer (Fase 5) em planejamento.
 
 ---
 
 ## 1. Contexto do Desafio
 
-### 1.1 Histórico dos Challenges
+### 1.1 O Problema
 
-| Edição | Nome | Dataset | Cidades | Métricas Oficiais |
-|--------|------|---------|---------|-------------------|
-| 2023 | HuMob Challenge 2023 | YJMob100K (cidade única, Japão) | 1 | GEO-BLEU, DTW |
-| 2024 | HuMob Challenge 2024 | YJMob multi-cidade (~4.5 GB) | A, B, C, D | GEO-BLEU, DTW |
-| 2025 | SIGSPATIAL GIS CUP 2025 | LY Corporation (~160 GB) | Multi-cidades | GEO-BLEU, DTW |
+Predição de mobilidade humana para o **HuMob Challenge 2024** (Yahoo Japan / SIGSPATIAL). Dado um usuário com histórico de localizações nos dias 1–60, prever suas coordenadas (x, y) para cada intervalo de 30 minutos nos dias 61–75.
 
-**Este projeto usa o dataset do HuMob 2024** (cidades A, B, C, D), com objetivo de publicar um artigo.
+- **Grade espacial:** 200×200 células (cada célula = 500m × 500m, área total ~100km²)
+- **Resolução temporal:** 48 slots/dia × 15 dias = **720 passos** a predizer
+- **Métricas oficiais:** GEO-BLEU (similaridade geográfica) e DTW (similaridade temporal)
+- **Referência de métricas:** https://github.com/yahoojapan/geobleu
+- **Objetivo:** Publicar artigo com resultados competitivos com o top do HuMob 2024 (GEO-BLEU 0.319, DTW 27.15).
 
-### 1.2 Definição do Problema
+### 1.2 Dataset (`humob_all_cities_v2_normalized.parquet`, ~4.5 GB)
 
-- **O que é previsto:** A localização (x, y) de um indivíduo em uma grade 200×200 a cada intervalo de 30 minutos
-- **Período de predição:** Dias 61–75 (15 dias × 48 slots = 720 passos por usuário)
-- **Período de treino:** Dias 1–60
-- **Resolução espacial:** Grade 200×200, cada célula = 500m × 500m
-- **Área total:** ~100km × 100km por cidade
+| Cidade | Rows | Users (aprox.) | Uso |
+|--------|------|----------------|-----|
+| A | 111.5M | 100.000 | Treino base |
+| B | 24.4M | 25.000 | Fine-tuning |
+| C | 18.5M | 20.000 | Fine-tuning |
+| D | 7.6M | 6.000 | Fine-tuning |
 
-### 1.3 Estrutura do Dataset (HuMob 2024)
-
-- **Cidade A:** 100.000 usuários, dados completos (dias 1–75) — usada para treino base
-- **Cidades B, C, D:** Dados de dias 1–60 disponíveis; dias 61–75 são o alvo de predição
-  - Cidade B: ~25.000 usuários
-  - Cidade C: ~20.000 usuários
-  - Cidade D: ~6.000 usuários
-- **Importante:** Os usuários **transitam entre cidades** — um indivíduo pode aparecer em A num dia e em B em outro. A esparsidade nos dados de B, C, D é consequência direta disso, não de ausência de dados.
-- **Colunas principais:** `uid`, `city_encoded` (0=A,1=B,2=C,3=D), `d_norm` [0,1], `t_sin`, `t_cos`, `x_norm`, `y_norm`, `POI_norm` (85-D)
-- **Arquivo:** `humob_all_cities_v2_normalized.parquet` (~4.5 GB, já normalizado)
-
-### 1.4 Métricas Oficiais do Challenge
-
-✅ **GEO-BLEU e DTW implementados** (`src/utils/metrics.py`, `evaluate_metrics.py`).
-
-| Métrica | Descrição | Melhor valor | Top 2024 | Nosso resultado (médio) |
-|---------|-----------|-------------|----------|------------------------|
-| **GEO-BLEU** | Similaridade geográfica de trajetórias (dia a dia) | Maior = melhor | 0.319 (Team 22) | ~0.079 (B+C+D) |
-| **DTW** | Dynamic Time Warping — similaridade temporal de trajetórias | Menor = melhor | 27.15 (Team 24) | ~189 (B+C+D) |
-
-Implementação de referência: https://github.com/yahoojapan/geobleu
+**Observações críticas:**
+- Usuários **transitam entre cidades** — um mesmo `uid` pode aparecer em A num dia e em B em outro. A esparsidade de B/C/D é consequência direta dessa mobilidade, não de ausência de dados.
+- Colunas: `uid`, `city_encoded` (0–3), `d_orig` (0–74), `d_norm` [0,1], `t_sin`, `t_cos`, `x_norm`, `y_norm`, `POI_norm` (array 85-D).
+- Todos os valores numéricos já normalizados.
 
 ---
 
-## 2. Arquitetura do Modelo
-
-### 2.1 Visão Geral
+## 2. Arquitetura Atual (v2)
 
 ```
-External Information Fusion          Partial Information (LSTM)
-─────────────────────────────        ──────────────────────────
-User Embedding (4-D)  ─┐             Coord Sequence
-City Embedding (4-D)  ─┤             (seq_len × 2) ──► BiLSTM
-Day Projection        ─┼──► Concat ──► Dense(8-D)
-Time Projection       ─┤
-POI Projection        ─┘
-        │                                    │
-        └────────────┬───────────────────────┘
-                     ▼
-             Weighted Fusion
-          (w_r · static + w_e · dynamic)
-                     │
-                     ▼
-             Destination Head
-          MLP → Softmax → Σ(prob × KMeans centers)
-                     │
-                     ▼
-              Predicted (x, y) ∈ [0, 1]²
+External Information                  Partial Information (BiLSTM)
+────────────────────                  ─────────────────────────────
+User Emb (64-D)      ─┐               Coord Sequence (T × 2)
+City Emb (16-D)      ─┤                        ↓
+Day Proj (32-D GELU) ─┼─ Concat ─► Dense(256)  BiLSTM(hidden=128)
+Time Proj (32-D GELU)─┤                        ↓ (T × 256)
+POI Proj (32-D GELU) ─┘                 Attention Pooling
+                                        (temperature = √256)
+                                                ↓
+                                           LayerNorm(256)
+       │                                        │
+       └──────────────── WeightedFusion ────────┘
+                    (w_r · static + w_e · dynamic)
+                               ↓
+                       Destination Head
+            MLP(256 → 1024 → 512 logits) ─► softmax
+                               ↓
+                   Σ(p_k · cluster_centers_k)
+                               ↓
+                     Predicted (x, y) ∈ [0,1]²
 ```
 
-### 2.2 Parâmetros do Modelo (versão atual — v1)
+### 2.1 Fases Implementadas (v2)
 
-| Parâmetro | Valor | Problema identificado |
-|-----------|-------|----------------------|
-| `sequence_length` | 720 | 15 dias × 48 slots |
-| `n_clusters` | 512 | KMeans sobre coordenadas da cidade A |
-| `n_users` | 100.000 | Total de usuários no dataset |
-| `lstm_hidden` | **4** (bidirecional → 8-D) | LSTM de 160 params para sequências de 720 passos |
-| `user_emb_dim` | **4** | 400K params gastos em 4 dimensões para 100K usuários |
-| `fusion_dim` | **8** | Toda trajetória + contexto comprimida em 8 números |
-| `poi_out_dim` | **4** | 85 features POI → 4-D é perda brutal |
-| Total params | ~662K | 60% são embedding de usuário; LSTM tem apenas 160 params |
+| Fase | Descrição | Status |
+|------|-----------|--------|
+| 1 | Reparametrização (`lstm_hidden=128`, `user_emb_dim=64`, `fusion_dim=256`) | ✅ |
+| 2 | Loss **CE sobre clusters KMeans** + MSE auxiliar (α=0.1) | ✅ |
+| 3 | **Attention pooling** sobre todos os outputs do LSTM | ✅ |
+| 4 | **Scheduled sampling** (ramp linear 0 → `max_scheduled_p`) | ✅ |
+| **5** | **Substituir BiLSTM por Transformer Encoder** | 🔵 Próxima |
+| 6 | Cobertura de usuários (seq_len adaptativo para C/D) | 🔵 Futuro |
 
-### 2.3 Pipeline de Treinamento (v1)
+### 2.2 Correções de Arquitetura (2026-04-14)
 
-1. **KMeans** — Calcula 512 centros de cluster sobre coordenadas da cidade A
-2. **Treino base** — 8 épocas na cidade A (AdamW, ReduceLROnPlateau, AMP)
-3. **Fine-tuning sequencial** — B → C → D, cada um partindo do checkpoint anterior (5 épocas, CosineAnnealingLR)
-4. **Avaliação** — Compara zero-shot vs fine-tuned + gera Pred+GT pairs
+Bugs identificados e corrigidos após análise detalhada:
 
----
+| Problema | Arquivo | Correção |
+|----------|---------|----------|
+| `criterion` undefined no val loop | `train.py` | `F.mse_loss(pred, target)` direto |
+| Attention collapse em seq longas | `partial_info.py` | Scores divididos por √output_dim |
+| LSTM output sem normalização | `humob_model.py` | LayerNorm(256) antes do WeightedFusion |
+| ReLU zerando 50% dos neurônios | `external_info.py` | ReLU → GELU em todas projeções |
 
-## 3. Resultados Obtidos (Experimento: exp_full_15d_a4000, março 2026)
+### 2.3 Invariantes Críticos da Arquitetura
 
-### 3.1 Treinamento Base (Cidade A)
-
-| Época | Train Loss | Val Loss |
-|-------|-----------|---------|
-| 1 | 0.00550 | 0.00409 |
-| 4 | 0.00364 | 0.00390 |
-| 8 | 0.00351 | 0.00384 |
-
-### 3.2 Fine-tuning por Cidade
-
-| Cidade | Épocas rodadas | Val Loss final |
-|--------|---------------|----------------|
-| B | 5 (early stop na 5ª) | 0.00268 |
-| C | 5 (early stop na 5ª) | 0.00234 |
-| D | 3 (verificar logs) | 0.00231 |
-
-### 3.3 Avaliação Final — cell_error (Zero-shot vs Fine-tuned)
-
-Avaliado com `n_samples=1000` usando `evaluate_model`:
-
-| Cidade | Zero-shot cell_error | FT cell_error | Melhoria | Zero-shot km | FT km |
-|--------|---------------------|---------------|----------|-------------|-------|
-| B | 4.59 células | 3.87 células | -15.7% | 2.30 km | 1.94 km |
-| C | 11.36 células | 10.04 células | -11.6% | 5.68 km | 5.02 km |
-| D | 4.86 células | 4.57 células | -6.0% | 2.43 km | 2.28 km |
-
-### 3.4 Cobertura de Usuários (pred_gt_all_users.parquet)
-
-Avaliado sobre todos os usuários com dados suficientes (`test_days=(0.55, 1.0)`, `max_seqs=30`):
-
-| Cidade | Usuários avaliados | Total do dataset | Cobertura | Mediana | Média | P90 |
-|--------|-------------------|-----------------|-----------|---------|-------|-----|
-| B | 2.334 | ~25.000 | 9.4% | **2.12 km** | 4.41 km | 11.34 km |
-| C | 1.406 | ~20.000 | 7.1% | **4.30 km** | 5.48 km | 11.01 km |
-| D | 1.970 | ~6.000 | 32.9% | **2.06 km** | 3.87 km | 9.55 km |
-
-**Por que só 5–33% dos usuários?** Com `seq_len=720`, o usuário precisa ter 720 registros consecutivos na cidade. Como os usuários transitam entre cidades, a maioria só aparece esporadicamente em B, C, D.
-
-### 3.5 Métricas Oficiais — GEO-BLEU e DTW (rodado em 2026-03-31)
-
-Avaliado sobre `pred_gt_all_users.parquet` (130.007 predições, 5.033 usuários):
-
-| Cidade | Usuários | GEO-BLEU | DTW | GEO-BLEU top 2024 | DTW top 2024 |
-|--------|----------|----------|-----|-------------------|--------------|
-| B | 2.334 | **0.1017** | **174.70** | 0.319 | 27.15 |
-| C | 1.406 | **0.0276** | **236.92** | 0.319 | 27.15 |
-| D | 1.970 | **0.1076** | **156.91** | 0.319 | 27.15 |
-
-**Interpretação:**
-- B e D atingem GEO-BLEU ~0.10 — baseline razoável, mas 3× abaixo do top
-- C apresenta GEO-BLEU 0.027, consistente com cell_error 2× maior observado
-- DTW alto (~175–237 vs 27 do top) indica desvios temporais significativos
-- A diferença para o top é esperada: líderes do HuMob 2024 usaram Transformers com arquiteturas muito maiores
+- **`fusion_dim` DEVE ser igual a `lstm_hidden * 2`** — `WeightedFusion` tem assert que quebra em runtime caso contrário
+- **`poi_proj = Linear(85, poi_out_dim)`** — POI_norm é array de 85 dimensões (coluna `object` no parquet)
+- **`n_users >= max(uid) + 1`** — uids vão de 0 a 99999 em todas as cidades
+- **Cluster centers são fixos** (`register_buffer`, não treináveis)
+- **`tracking_uri`** — use `file:/tmp/mlruns` em smoke para evitar erros de permissão
 
 ---
 
-## 4. Diagnóstico do Modelo Atual
+## 3. Status Atual (2026-04-15)
 
-Análise realizada em 2026-04-10 após inspeção dos pesos salvos (`humob_model_finetuned_B.pt`).
+### 3.1 Primeira Epoch de Treino v2 Completada
 
-### 4.1 Modelo Severamente Subparametrizado
+Config: `config/exp_full_15d_a4000.yaml` (seq_len=336, lr=1e-4, max_scheduled_p=0.3)
 
-| Camada | Tamanho atual | Tamanho adequado | Impacto |
-|--------|--------------|-----------------|---------|
-| `lstm_hidden` | **4** (BiLSTM → 8-D) | 64–128 | LSTM com 160 params não captura 720 passos |
-| `user_emb_dim` | **4** para 100K usuários | 32–64 | 4-D não representa identidade do usuário |
-| `fusion_dim` | **8** | 64–128 | Trajetória inteira + contexto em 8 números |
-| `poi_out_dim` | **4** | 16–32 | 85 features POI perdidas |
+| Métrica | Valor |
+|---------|-------|
+| Train loss (CE+MSE) | **4.1226** |
+| Val loss (MSE) | **0.0071** |
+| Tempo por epoch | ~9h |
+| Batches por epoch | ~24.500 |
+| Val batches | 199 (de `max_val_batches=200`) |
 
-Os 662K params são enganosos: **400K (60%) são a embedding de usuário `(100000, 4)`** — que tem quase nenhum poder expressivo com apenas 4 dimensões. O LSTM real tem **160 params** apenas.
+**Observações:**
+- Val loss **real** pela primeira vez (antes sempre 0.0000 devido ao bug do `criterion`)
+- Train loss caindo (baseline uniforme CE sobre 512 clusters seria log(512)=6.24)
+- Gradientes **continuam explodindo** (pre-clip entre 11 e 59 em quase todo batch, clip em 2.0)
 
-### 4.2 Loss Function Desalinhada das Métricas
+### 3.2 Problema Estrutural: BPTT em BiLSTM
 
-O modelo treina com `MSELoss` em coordenadas `[0,1]`, mas é avaliado com **GEO-BLEU e DTW** que medem similaridade de trajetórias. Não há sinal de treinamento sobre consistência temporal de sequências.
+Com seq_len=336, o LSTM faz backprop por 336 passos. Os gradientes se multiplicam recursivamente pelas matrizes de transição — resultado: **pre-clip entre 11-59 em quase todo batch**, com clip em 2.0 cortando >90% do sinal.
 
-Além disso, o modelo já gera **logits sobre 512 clusters** e depois converte para coordenadas — mas é treinado com MSE nas coordenadas finais, não com cross-entropy nos clusters. O sinal de treinamento é indireto.
+Essa é uma limitação intrínseca de LSTMs sobre sequências longas. Truncated BPTT mitigaria, mas a solução arquiteturalmente correta é migrar para Transformer.
 
-### 4.3 LSTM Desperdiça o Contexto da Sequência
+### 3.3 Baseline v1 (Para Comparação)
 
-`CoordLSTM` usa apenas `h_n[-1]` (último hidden state) para uma sequência de 720 passos. Os 719 hidden states intermediários — que contêm os padrões de movimento ao longo do tempo — são completamente descartados.
+Arquitetura subparametrizada anterior (`lstm_hidden=4`, `fusion_dim=8`, MSE loss):
 
-### 4.4 Head MLP Desproporcional
-
-A head `8 → 500 → 512` tem **262K params** para uma entrada de **8 dimensões**. É o maior componente do modelo depois das embeddings, mas alimentado por um vetor minúsculo.
-
-### 4.5 Desalinhamento Treino/Avaliação
-
-O modelo treina passo-a-passo (`forward_single_step`), mas é avaliado com rollout autoregressivo de 720 passos. Erros se acumulam durante a avaliação de forma que o modelo nunca viu durante o treino.
+| Métrica | Cidade B | Cidade C | Cidade D | Top HuMob 2024 |
+|---------|----------|----------|----------|----------------|
+| GEO-BLEU | 0.1017 | 0.0276 | 0.1076 | **0.319** |
+| DTW | 174.70 | 236.92 | 156.91 | **27.15** |
 
 ---
 
-## 5. Plano de Implementação — v2
+## 4. Fase 5 — Migração para Transformer Encoder
 
-### Fase 1 — Reparametrização (🔴 Crítico — sem mudar arquitetura)
+### 4.1 Motivação
 
-**O maior ganho com menor risco.** Apenas mudança de hiperparâmetros no YAML:
+1. **Elimina BPTT** — atenção processa todos os timesteps em paralelo, sem propagação recursiva de gradiente. Fim da explosão estrutural.
+2. **Teto de performance mais alto** — top HuMob 2024 usou Transformers; literatura consolidada para mobilidade.
+3. **Paraleliza no tempo** — LSTM é sequencial; Transformer pode ser 3–5× mais rápido por epoch em GPU.
+4. **Padrões de longo alcance** — atenção global captura naturalmente "mesmo horário na semana passada" sem degradação.
 
-```yaml
-# config/exp_v2_reparametrizado.yaml
-model:
-  user_emb_dim: 32      # era 4  → mais expressividade por usuário
-  city_emb_dim: 8       # era 4
-  temporal_dim: 16      # era 8
-  poi_out_dim: 16       # era 4  → aproveita os 85 features POI
-  lstm_hidden: 64       # era 4  → bidirecional produz 128-D
-  fusion_dim: 128       # era 8  → head MLP tem entrada decente
-  n_clusters: 512       # mantém
-```
-
-**Impacto estimado:** O modelo passa de ~2.4M params funcionais (excluindo embedding de usuário que é inutilizada), com o LSTM capaz de modelar dependências temporais reais.
-
-**Arquivos a editar:** `config/exp_full_15d_a4000.yaml` + adicionar args ao `HuMobModel.__init__` lido do YAML.
-
-### Fase 2 — Loss Function (🔴 Crítico — alto impacto)
-
-Substituir `MSELoss` por **cross-entropy sobre os índices de cluster** como loss primária:
+### 4.2 Design do `CoordTransformer`
 
 ```python
-# src/training/train.py — dentro do loop de treino
-# 1. Obter logits (antes da softmax) — requer expor no modelo
-cluster_logits = model.destination_head.mlp(fused)  # (B, n_clusters)
+class CoordTransformer(nn.Module):
+    def __init__(self, input_size=2, d_model=256, nhead=8,
+                 num_layers=4, dim_feedforward=512, max_len=720,
+                 dropout=0.1):
+        # 1. Projeção de entrada (2-D → 256-D)
+        self.input_proj = nn.Linear(input_size, d_model)
 
-# 2. Calcular índice do cluster mais próximo do target
-target_cluster = find_nearest_cluster(target_coords, cluster_centers)  # (B,)
+        # 2. Positional encoding aprendível (seq_len fixo por config)
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_len, d_model) * 0.02)
 
-# 3. Loss principal: CE nos clusters + MSE auxiliar nas coordenadas
-loss_ce = F.cross_entropy(cluster_logits, target_cluster)
-loss_mse = F.mse_loss(pred_coords, target_coords)
-loss = loss_ce + 0.1 * loss_mse
-```
+        # 3. Encoder: N camadas de self-attention + FFN
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True,
+            activation='gelu', norm_first=True  # pre-norm: mais estável
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
 
-**Por que isso melhora GEO-BLEU/DTW:** O modelo passa a aprender explicitamente "em qual região geográfica o usuário estará", que é o que GEO-BLEU mede. O MSE sobre coordenadas contínuas é um proxy fraco para esse objetivo.
-
-**Arquivos a editar:** `src/models/humob_model.py` (expor logits), `src/training/train.py` (loss), `src/training/finetune.py` (loss).
-
-### Fase 3 — Attention Pooling no LSTM (🟡 Importante)
-
-Em vez de descartar 719 hidden states, adicionar atenção aprendível sobre toda a sequência:
-
-```python
-# src/models/partial_info.py — substituir último hidden por attention pooling
-class CoordLSTM(nn.Module):
-    def __init__(self, ...):
-        ...
-        self.attention = nn.Linear(hidden_size * num_directions, 1)
+        # 4. Pooling: mean pooling ou CLS token (TBD)
+        self.output_dim = d_model
 
     def forward(self, x):
-        output, (h_n, _) = self.lstm(x)      # output: (B, 720, hidden*2)
-        scores = self.attention(output)        # (B, 720, 1)
-        weights = F.softmax(scores, dim=1)     # (B, 720, 1)
-        context = (weights * output).sum(dim=1)  # (B, hidden*2)
-        return context
+        # x: (B, T, 2)
+        h = self.input_proj(x) + self.pos_embedding[:, :x.size(1)]
+        h = self.encoder(h)              # (B, T, d_model)
+        return h.mean(dim=1)             # mean pooling → (B, d_model)
 ```
 
-**Por que isso melhora:** O modelo pode aprender a focar em partes relevantes da trajetória (ex: padrões do dia anterior, horários de pico) em vez de usar apenas o último passo.
+### 4.3 Parâmetros Escolhidos e Justificativa
 
-**Arquivo a editar:** `src/models/partial_info.py`.
+| Parâmetro | Valor | Por quê |
+|-----------|-------|---------|
+| `d_model` | 256 | Mesmo valor de `fusion_dim` atual — mantém `WeightedFusion` funcionando sem mudança |
+| `nhead` | 8 | Head size = 32-D, razoável para coordenadas |
+| `num_layers` | 4 | Começar com 4; 6 se houver memória sobrando |
+| `dim_feedforward` | 512 | 2× d_model, conservador |
+| `dropout` | 0.1 | Baixo; sequências longas e batches grandes ajudam a regularizar |
+| `norm_first` | True | Pre-norm: mais estável em treinamento do zero |
+| `activation` | GELU | Consistente com resto do modelo |
+| Pooling | Mean | Simples e robusto; considerar CLS token em experimento posterior |
 
-### Fase 4 — Scheduled Sampling (🟡 Importante)
+### 4.4 Complexidade Computacional
 
-Reduz o mismatch entre treino (coordenadas reais como input) e avaliação (coordenadas preditas como input):
+- **Atenção global** em seq_len=336: O(336²) = 113k operações por head
+- Com 8 heads × 4 layers = 3.6M operações de atenção por sample
+- Batch=64 → 230M operações por batch — cabe facilmente em 16GB VRAM
+- **Memória de atenção:** 336² × 8 × 4 bytes × 64 batch ≈ 230MB por layer → ~1GB total, aceitável
 
-```python
-# Durante treino: com probabilidade p_scheduled, usar predição anterior
-# como input em vez da coordenada real. p cresce de 0→0.5 ao longo das épocas.
-if random.random() < p_scheduled:
-    next_input = pred.detach()  # usa predição própria
-else:
-    next_input = ground_truth   # usa dado real (teacher forcing)
-```
+Se no futuro quisermos voltar a `seq_len=720`, aí entra **atenção local** (janela de 48 = 1 dia), que é O(720 × 48) em vez de O(720²).
 
-**Arquivo a editar:** `src/training/train.py`.
+### 4.5 Arquivos a Modificar
 
-### Fase 5 — Arquitetura Transformer (🟢 Desejável — maior ganho potencial)
+| Arquivo | Mudança |
+|---------|---------|
+| `src/models/partial_info_transformer.py` | **Novo** — classe `CoordTransformer` |
+| `src/models/humob_model.py` | Condicional `encoder_type` no `__init__` para escolher LSTM ou Transformer |
+| `config/exp_full_15d_a4000.yaml` | Adicionar bloco `encoder:` com hiperparâmetros do Transformer |
+| `run_automate.py` | Ler `encoder_type` e hiperparâmetros do YAML |
+| `PRD.md` e `CLAUDE.md` | Documentar a nova arquitetura |
 
-Substituir o BiLSTM por um **Transformer Encoder com atenção local** (janela de 48 slots = 1 dia). Os top performers do HuMob 2024 usaram exatamente essa abordagem.
+### 4.6 Estratégia de Migração
 
-```
-Coord Sequence (720 × 2)
-    ↓ positional encoding
-Transformer Encoder (local attention, window=48)
-    ↓ [CLS] token ou mean pooling
-Context Vector (256-D)
-```
+1. **Implementar `CoordTransformer`** em paralelo ao `CoordLSTM` (não remover ainda)
+2. **Config condicional:** `encoder_type: "lstm" | "transformer"` no YAML
+3. **Rodar smoke** com Transformer para validar forward/backward/loss
+4. **Rodar experimento completo com Transformer** (`n_epochs: 15`, finetune como sempre)
+5. **Comparar GEO-BLEU/DTW** com v2 BiLSTM (epoch 1 atual como baseline)
+6. **Se Transformer vencer** — remover CoordLSTM em um commit separado
 
-**Considerações:** Sequências de 720 passos com atenção global são O(720²) — pesado. Usar atenção local com janela de 48 (1 dia) ou atenção esparsa é essencial.
+### 4.7 Riscos e Mitigações
 
-**Arquivo a criar:** `src/models/partial_info_transformer.py`.
-
-### Fase 6 — Ampliar Cobertura de Usuários (🟢 Desejável)
-
-Para cobrir mais usuários no artigo (atualmente 7–33%):
-
-```
-Opção A (sem re-treino): seq_len adaptativo na avaliação
-  - Usuários com 360-719 registros → usar seq_len=360
-  - Limitação: comparação direta não é possível
-
-Opção B (re-treino com seq_len=360):
-  - Estimativa: 2× mais usuários cobertos
-  - Menos contexto por predição, potencialmente menor qualidade
-
-Opção C (modelo unificado multi-cidade):
-  - Treinar sem fine-tuning separado, usando city_embedding
-  - Captura padrões de transição entre cidades
-```
+| Risco | Mitigação |
+|-------|-----------|
+| Overfitting em seq longas com poucos dados por user | Dropout 0.1 + weight decay; monitorar val_loss |
+| Positional encoding fixo não generaliza para seq_len variáveis | Usar seq_len fixo no config; avaliar com mesmo seq_len |
+| Transformer não aprende padrões curtos tão bem quanto LSTM | Mean pooling sobre toda sequência captura ambos |
+| Memória explodir com batch grande | Começar com batch=64 (igual atual); `torch.compile` se precisar |
 
 ---
 
-## 6. Bugs Corrigidos (histórico importante)
+## 5. Próximas Fases (Pós-Transformer)
 
-### Bug 1 — `val_days` insuficiente no fine-tuning (`finetune.py`)
-- **Problema:** `val_days=(0.8, 1.0)` = ~15 dias = 720 time steps = exatamente `sequence_length`. Impossível formar sequências válidas → `val_count=0` → `val_loss=0.0`
-- **Sintoma:** Early stopping após 2 épocas (de 5 configuradas), val_loss sempre 0.0 no MLflow
-- **Correção:** `val_days=(0.5, 1.0)` (30 dias de janela)
-- **Arquivo:** `src/training/finetune.py`, linhas 128 e 138
+### Fase 6 — Cobertura de Usuários em C e D
 
-### Bug 2 — Flush prematuro do spillover (`dataset.py`)
-- **Problema:** Quando um chunk do parquet não tinha dados relevantes, o código fazia flush de TODOS os usuários acumulados, mesmo que tivessem dados chegando em chunks futuros
-- **Sintoma:** Usuários com dados esparsos geravam sequências incompletas
-- **Correção:** Remover o flush e reset de `prev_uids` quando `df is None`; apenas `continue`
-- **Arquivo:** `src/data/dataset.py`, função `__iter__`
+Com seq_len=336, City D (média 76 pts/user) ainda filtra maioria dos usuários. Opções:
 
-### Bug 3 — MLflow sobrescrevia métricas na comparação (`finetune.py`)
-- **Problema:** `compare_models_performance` logava todos os modelos no mesmo run MLflow. `model_type` era sempre `"zero_shot"` porque a detecção usava `"fine" in model_name.lower()` mas os nomes eram `"FT B"`
-- **Correção:** Criar run MLflow separado por modelo; corrigir detecção para `any(k in model_name.upper() for k in ["FT", "FINE"])`
-- **Arquivo:** `src/training/finetune.py`, função `compare_models_performance`
+- **Seq_len adaptativo na avaliação** — usar 144 para users com <336 pontos
+- **Re-treino multi-seq-len** — modelo aceita qualquer seq_len fixo ≥ 48
+- **Modelo unificado multi-cidade** — treinar sem fine-tuning usando `city_emb` como diferenciador
 
----
+### Fase 7 — Ablation Study para o Artigo
 
-## 7. Limitações Conhecidas
-
-### 7.1 Cobertura de Usuários
-Com `seq_len=720`, apenas 7–33% dos usuários têm dados suficientes para avaliação. Limitação intrínseca do dataset (usuários transitam entre cidades).
-
-### 7.2 Transição entre Cidades não Modelada
-O modelo trata cada cidade de forma independente. Na realidade, os usuários transitam entre cidades — uma previsão mais realista deveria considerar a trajetória global.
-
-### 7.3 Conversão km não Verificada Empiricamente
-O fator de conversão `1 célula = 0.5 km` foi inferido do código (`ft_avg * 0.5`). Não foi verificado contra a documentação oficial do dataset YJMob.
+- Transformer vs BiLSTM (same hyperparams)
+- Com/sem attention pooling
+- CE vs MSE loss
+- Scheduled sampling on/off
+- Com/sem POI features
 
 ---
 
-## 8. Estado Atual dos Arquivos
+## 6. Bugs Conhecidos e Histórico
 
-### 8.1 Modelos Salvos (no servidor `cia6`, pasta `~/clnn_v2/`)
+### Bugs Ativos (não corrigidos)
 
-| Arquivo | Descrição | Data |
-|---------|-----------|------|
-| `outputs/models/humob_model_A.pt` | Modelo base treinado (8 épocas, cidade A) | 2026-03-30 |
-| `humob_model_finetuned_B.pt` | Fine-tuned cidade B (val_loss=0.00268) | 2026-03-31 |
-| `humob_model_finetuned_C.pt` | Fine-tuned cidade C (val_loss=0.00234) | 2026-03-31 |
-| `humob_model_finetuned_D.pt` | Fine-tuned cidade D (última da cadeia) | 2026-03-31 |
+- **BPTT estrutural em BiLSTM** — gradientes explodem (pre=11-59, clip=2.0). **Solução: Fase 5 (Transformer).**
+- **Cobertura em City D** — 76 pts/user, seq_len=336 requer 337. Solução: Fase 6.
 
-### 8.2 Artefatos de Avaliação
+### Bugs Corrigidos em 2026-04-14 (sessão de diagnóstico)
 
-| Arquivo | Descrição |
-|---------|-----------|
-| `outputs/eval/pred_gt_all_users.parquet` | 130.007 predições, 5.033 usuários, dias 61–75 |
-| `mlruns/` | Todos os runs MLflow (treino, finetuning, comparação, métricas oficiais) |
+1. **Val loop `criterion` undefined** — `criterion` só existia em `evaluate_model`, não em `train_humob_model`. Todas as batches de val lançavam `NameError` silenciosamente → `val_count=0` → `val_loss=0.0` → early stopping falso.
+2. **Attention collapse** — softmax sem temperatura sobre 336 timesteps colapsa em 1-2 posições.
+3. **LSTM output sem LayerNorm** — magnitude de `dyn_emb` divergia de `static_red` (que tinha LayerNorm), desbalanceando o WeightedFusion.
+4. **ReLU matando features temporais/POI** — Xavier init + features em [0,1] zera metade dos neurônios.
+5. **Config `sequence_length=720`** — descartava maioria dos users de C/D (média 76 pts/user em D). Reduzido para 336.
+6. **Config `max_scheduled_p=0.7`** — agressivo demais treinando do zero. Reduzido para 0.3.
+7. **Config `learning_rate=3e-5`** — conservador pós-fixes de arquitetura. Aumentado para 1e-4.
 
-### 8.3 Scripts Importantes
+### Bugs Corrigidos Anteriormente
 
-| Script | Descrição |
-|--------|-----------|
-| `run_automate.py` | Pipeline principal (YAML → KMeans → treino → FT → avaliação) |
-| `eval_comparison.py` | Re-avaliação zero-shot vs FT com MLflow correto |
-| `generate_full_eval.py` | Gera pred_gt para todos os usuários disponíveis |
-| `evaluate_metrics.py` | ★ Calcula GEO-BLEU e DTW oficiais a partir do parquet existente |
+- **`val_days` insuficiente no finetune** — `(0.8, 1.0)` = 15 dias = seq_len → zero sequências. Corrigido para `(0.5, 1.0)`.
+- **Flush prematuro do spillover** em `dataset.py` — usuários com dados esparsos perdiam sequências.
+- **MLflow sobrescrevia métricas** — `compare_models_performance` agrupava todos os modelos no mesmo run.
 
 ---
 
-## 9. Infraestrutura de Acesso
+## 7. Infraestrutura
 
-### 9.1 Servidor de Treinamento
+### 7.1 Servidor de Treinamento (cia6)
 
 | Item | Valor |
 |------|-------|
 | Host | `192.168.222.252` (acesso via VPN) |
-| Usuário | `anderson.clemente` |
+| Usuário | `anderson.clemente` (**sem sudo**) |
 | GPU | NVIDIA RTX A4000 (16 GB VRAM) |
 | Repositório | `~/clnn_v2/` |
-| Branch principal | `main` |
 | Docker image | `humob:cu128` (~9.2 GB, já construída) |
 
-### 9.2 Acesso (do WSL Ubuntu no Windows)
+### 7.2 Execução
 
 ```bash
-# 1. VPN (terminal 1 — deixar rodando)
+# VPN (terminal 1, deixar rodando)
 sudo openvpn --config ~/client.ovpn
 
-# 2. SSH (terminal 2)
+# SSH + tmux (terminal 2)
 ssh anderson.clemente@192.168.222.252
+tmux new -s humob_full
 
-# 3. Tmux no servidor
-tmux new -s experimento   # nova sessão
-tmux attach -t experimento   # retomar sessão existente
-
-# 4. Rodar experimento
+# Docker SEM sudo (usuário está no grupo docker)
 cd ~/clnn_v2
-docker run --rm --gpus all -u $(id -u):$(id -g) \
+docker run --rm --gpus all \
   -e PYTHONPATH=/workspace \
-  -e MPLCONFIGDIR=/tmp/mpl \
-  -v "$(pwd):/workspace" humob:cu128 \
+  -v "$PWD:/workspace" humob:cu128 \
   python /workspace/run_automate.py --config /workspace/config/exp_full_15d_a4000.yaml
 
-# 5. Calcular métricas oficiais (GEO-BLEU + DTW)
-docker run --rm --gpus all -u $(id -u):$(id -g) \
+# Avaliação oficial (GEO-BLEU + DTW)
+docker run --rm --gpus all \
   -e PYTHONPATH=/workspace \
-  -e MPLCONFIGDIR=/tmp/mpl \
-  -v "$(pwd):/workspace" humob:cu128 \
+  -v "$PWD:/workspace" humob:cu128 \
   python /workspace/evaluate_metrics.py
 ```
 
-**Notas de acesso:**
-- Anderson NÃO tem sudo no servidor (equipamento compartilhado)
-- Não mexer em `/datastore/docker`; não desinstalar drivers de vídeo
-- Chave SSH configurada em `~/.ssh/id_ed25519` (sem senha)
-- VPN não afeta internet geral (só roteia 192.168.22.0/24 e 192.168.222.0/24)
+### 7.3 Permissões (gotchas)
+
+- Container roda como `laccan` (UID 1000, appuser da imagem)
+- Arquivos no host criados por `anderson.clemente` (UID diferente) precisam `chmod o+w`
+- `mlruns/` deve ser 757 ou compatível para o container escrever
+- Checkpoints em `outputs/models/checkpoints/` ficam owned por `laccan` — o container pode sobrescrever nas próximas epochs
 
 ---
 
-## 10. Estrutura do Projeto
+## 8. Estrutura do Projeto
 
 ```
 clnn_v2/
 ├── config/
-│   ├── smoke.yaml                  # seq_len=12, n_clusters=16, 1 época (teste rápido)
-│   ├── big_smoke.yaml              # seq_len=720, n_clusters=512, 8/5 épocas, split="test"
-│   └── exp_full_15d_a4000.yaml     # ★ Config de produção (split="val", num_workers=4)
+│   ├── smoke_v2.yaml               # Teste rápido (seq_len=12, 2 epochs, checkpoints)
+│   └── exp_full_15d_a4000.yaml     # ★ Config de produção
 ├── src/
 │   ├── data/dataset.py             # HuMobNormalizedDataset (IterableDataset + spillover)
 │   ├── models/
-│   │   ├── humob_model.py          # HuMobModel + discretize_coordinates
-│   │   ├── external_info.py        # ExternalInformationFusionNormalized
-│   │   └── partial_info.py         # CoordLSTM (BiLSTM) — Fase 3: adicionar attention pooling
+│   │   ├── humob_model.py          # HuMobModel (escolhe encoder via config)
+│   │   ├── external_info.py        # Embeddings + projeções GELU
+│   │   ├── partial_info.py         # CoordLSTM com attention pooling + temperatura
+│   │   └── partial_info_transformer.py  # (a criar — Fase 5)
 │   ├── training/
-│   │   ├── train.py                # train_humob_model + evaluate_model — Fase 2: loss CE
-│   │   ├── finetune.py             # finetune_model + sequential_finetuning
-│   │   └── pipeline.py             # generate_humob_submission + generate_pred_gt_parquet
+│   │   ├── train.py                # train_humob_model com CE+MSE loss
+│   │   ├── finetune.py             # Fine-tuning sequencial B→C→D
+│   │   └── pipeline.py             # generate_humob_submission + pred_gt_parquet
 │   └── utils/
-│       ├── metrics.py              # ★ compute_geobleu() + compute_dtw() (métricas oficiais)
+│       ├── metrics.py              # compute_geobleu() + compute_dtw()
 │       ├── mlflow_tracker.py       # HuMobMLflowTracker
-│       └── simple_checkpoint.py    # save/load/cleanup checkpoints
-├── run_automate.py                 # ★ Ponto de entrada principal
-├── evaluate_metrics.py             # ★ GEO-BLEU + DTW sobre pred_gt_all_users.parquet
-├── eval_comparison.py              # Re-avaliação MLflow correto (zero-shot vs FT)
-├── generate_full_eval.py           # Pred+GT para todos os usuários disponíveis
+│       └── simple_checkpoint.py    # save/load/cleanup
+├── run_automate.py                 # ★ Ponto de entrada (YAML → pipeline completo)
+├── evaluate_metrics.py             # ★ GEO-BLEU + DTW a partir do pred_gt_all_users.parquet
+├── PRD.md                          # ★ Este arquivo
+├── CLAUDE.md                       # Contexto rápido para novas sessões
 ├── dockerfile                      # pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
 └── data/
-    └── humob_all_cities_v2_normalized.parquet  # ~4.2 GB
+    └── humob_all_cities_v2_normalized.parquet  # ~4.2 GB, normalizado
 ```
 
 ---
 
-## 11. Stack Tecnológica
+## 9. Stack Tecnológica
 
 | Componente | Tecnologia |
-|---|---|
+|------------|------------|
 | Framework ML | PyTorch 2.7 |
 | GPU | CUDA 12.8 + cuDNN 9 |
 | Dados | Parquet (PyArrow) ~4.2 GB |
-| Tracking | MLflow (local, `file:./mlruns`) |
+| Tracking | MLflow local (`file:./mlruns`) |
 | Container | Docker `humob:cu128` (~9.2 GB) |
 | Hardware | NVIDIA RTX A4000 (16 GB VRAM) |
-| OS servidor | Linux (domínio `orion.net`, UFAL) |
-| Métricas oficiais | geobleu (Yahoo Japan) + fastdtw |
+| Métricas | geobleu (Yahoo Japan) + fastdtw |
 
 ---
 
-## 12. Diagnóstico de Arquitetura — Sessão 2026-04-14
+## 10. Convenções
 
-### 12.1 Bugs Corrigidos no Val Loop
-
-**Bug:** `criterion` não estava definido no escopo de `train_humob_model`.
-
-O val loop chamava `criterion(pred, target)`, mas `criterion = nn.MSELoss()` só existe dentro de `evaluate_model`. Em cada batch de val, um `NameError` era lançado silenciosamente pelo `except Exception: continue`, deixando `val_count=0` e `val_loss=0.0` para sempre. O early stopping era ativado incorretamente após 3 épocas com val_loss=0.
-
-**Correção:** substituído por `F.mse_loss(pred, target)` direto no val loop (`train.py:399`).
-
----
-
-### 12.2 Problemas de Arquitetura Identificados e Corrigidos
-
-**1. Attention collapse com seq_len longo** (`partial_info.py`)
-
-Softmax sobre 720 timesteps sem temperatura colapsa para 1-2 posições (winner-takes-all). Equivalente a usar só o último hidden state, anulando o benefício do attention pooling.
-
-**Correção:** dividir scores por `√output_dim` antes do softmax (scaled dot-product attention).
-
-```python
-scale = self.output_dim ** 0.5
-scores = self.attention(output).squeeze(-1) / scale
-```
-
-**2. LSTM output sem normalização** (`humob_model.py`)
-
-`static_red` passa por LayerNorm em `ExternalInformationDense`, mas `dyn_emb` (LSTM output) chegava cru ao `WeightedFusion`. Com magnitudes divergentes e pesos escalares fixos (w_r, w_e), um dos sinais dominava completamente.
-
-**Correção:** `nn.LayerNorm(lstm_hidden * 2)` aplicado ao output do LSTM antes da fusão.
-
-**3. ReLU matando capacidade em features numéricas** (`external_info.py`)
-
-`d_norm ∈ [0,1]` com Xavier init produz 50% dos neurônios zerados por ReLU desde o início. Mesmo problema em `time_proj`, `poi_proj` e `ExternalInformationDense`.
-
-**Correção:** substituído ReLU por GELU em todas essas projeções. GELU não zera gradiente para entradas negativas e tem comportamento mais suave.
-
----
-
-### 12.3 Análise dos 512 Clusters KMeans (centers_A_512.npy)
-
-- **Cobertura:** X ∈ [0.003, 0.99], Y ∈ [0.006, 0.99] — cobre todo o grid ✅
-- **Distribuição:** mean (0.60, 0.44) — centro urbano deslocado para direita, padrão realista
-- **Redundância:** dist_min=0.012, p05=0.103 → ~5% dos clusters estão a <20 pixels de distância, efectivamente duplicados
-- **Impacto:** ~25 dos 512 clusters são redundantes → CE loss com ruído residual estrutural
-- **Ação:** tolerar por agora; considerar reduzir para 256 se loss estagnar acima de 3.0
-
----
-
-### 12.4 Inconsistências Config vs. Dataset (descobertas em 2026-04-14)
-
-| Parâmetro | Valor anterior | Valor correto | Motivo |
-|-----------|---------------|---------------|--------|
-| `sequence_length` | 720 (15 dias) | **336** (7 dias) | seq=720 exige 721 pontos contíguos; média é 1115/user em A, <100 em D → maioria dos users de D era descartada |
-| `max_scheduled_p` | 0.7 | **0.3** | 70% de substituição na fase inicial = modelo aprende sobre seu próprio ruído; 30% é mais seguro |
-| `learning_rate` | 3e-5 | **1e-4** | Reduzido por explosões antes dos fixes de arquitetura; com LayerNorm + attention temperature, 1e-4 é estável |
-
-**Impacto do sequence_length:**
-- City A: 111.5M rows / 100k users ≈ 1.115 pts/user → ambos os tamanhos viáveis
-- City D: 7.6M rows / ~6k users ≈ 76 pts/user → seq=720 descarta quase todos; seq=336 ainda exige 337 pts (crítico para D)
-- Cobertura de usuários esperada: significativamente maior com seq=336
-
----
-
-### 12.5 Estado Pós-Correções (2026-04-14)
-
-| Item | Status |
-|------|--------|
-| Fases 1–4 implementadas | ✅ Completo |
-| Bug val `criterion` undefined | ✅ Corrigido |
-| Attention temperature | ✅ Aplicado |
-| LayerNorm no LSTM output | ✅ Aplicado |
-| ReLU → GELU | ✅ Aplicado |
-| Config sequence_length 720→336 | ✅ Aplicado |
-| Config max_scheduled_p 0.7→0.3 | ✅ Aplicado |
-| Config lr 3e-5→1e-4 | ✅ Aplicado |
-| Checkpoints incompatíveis descartados | ✅ Feito |
-| Treino v2 corrigido iniciado | ⏳ Aguardando início |
-| Fase 5 (Transformer) | 🔵 Próxima fase |
+- **Sempre rodar via Docker** — nunca instalar dependências direto no servidor
+- **Dados em [0,1]** — não desnormalizar antes do modelo
+- **Coordenadas discretas** via `discretize_coordinates()` para submissão (grade 0–199)
+- **Branch única `main`** — trabalho em feature branches, merge ao concluir
+- **Checkpoints** em `outputs/models/checkpoints/` — mantém os 3 últimos
+- **Nunca executar experimentos remotamente via SSH na sessão** — o usuário roda em seu próprio tmux
