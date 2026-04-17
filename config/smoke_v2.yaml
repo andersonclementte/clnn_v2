@@ -23,6 +23,13 @@ model:
   loss_alpha: 0.1
   # Fase 4 — scheduled sampling
   max_scheduled_p: 0.5
+  # Fase 5 — encoder
+  encoder:
+    type: "transformer"
+    transformer_nhead: 4
+    transformer_num_layers: 2
+    transformer_ff_dim: 256
+    transformer_dropout: 0.1
 
 training:
   base:
